@@ -15,10 +15,11 @@
   },
   "license": "ISC",
   "author": "thanksstevenkim",
-  "type": "commonjs",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "echo \\\"Error: no test specified\\\" && exit 1"
+    "dev": "nodemon src/server.js",
+    "setup-db": "node src/database.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
