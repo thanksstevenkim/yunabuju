@@ -1,0 +1,35 @@
+{
+  "name": "yunabuju",
+  "version": "1.0.0",
+  "description": "Automated Korean ActivityPub Server Aggregator",
+  "keywords": [
+    "[]"
+  ],
+  "homepage": "https://github.com/thanksstevenkim/yunabuju#readme",
+  "bugs": {
+    "url": "https://github.com/thanksstevenkim/yunabuju/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thanksstevenkim/yunabuju.git"
+  },
+  "license": "ISC",
+  "author": "thanksstevenkim",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \\\"Error: no test specified\\\" && exit 1"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-cron": "^3.0.3",
+    "node-fetch": "^3.3.2",
+    "pg": "^8.13.1",
+    "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
