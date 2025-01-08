@@ -4,18 +4,18 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const createTableSQL = `
-  CREATE TABLE IF NOT EXISTS korean_servers (
-    id SERIAL PRIMARY KEY,
-    domain VARCHAR(255) NOT NULL UNIQUE,
-    first_discovered TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_checked TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    is_active BOOLEAN DEFAULT true,
-    korean_usage_rate FLOAT,
-    description TEXT,
-    total_users INTEGER,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
+ CREATE TABLE IF NOT EXISTS yunabuju_servers (
+   id SERIAL PRIMARY KEY,
+   domain VARCHAR(255) NOT NULL UNIQUE,
+   first_discovered TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+   last_checked TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+   is_active BOOLEAN DEFAULT true,
+   korean_usage_rate FLOAT,
+   description TEXT,
+   total_users INTEGER,
+   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+ );
 `;
 
 async function setupDatabase() {
@@ -24,6 +24,10 @@ async function setupDatabase() {
   });
 
   try {
+    // 기존 테이블 삭제
+    await pool.query("DROP TABLE IF EXISTS korean_servers;");
+
+    // 새 테이블 생성
     await pool.query(createTableSQL);
     console.log("Database table created successfully");
   } catch (error) {

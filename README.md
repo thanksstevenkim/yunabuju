@@ -10,7 +10,7 @@
 
 1. PostgreSQL 데이터베이스 생성:
    \`\`\`bash
-   createdb activitypub_directory
+   createdb yunabuju
    \`\`\`
 
 2. 의존성 설치:
