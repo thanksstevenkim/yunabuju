@@ -1,5 +1,6 @@
 import pg from "pg";
 import dotenv from "dotenv";
+import { fileURLToPath } from "url";
 
 dotenv.config();
 
@@ -19,25 +20,48 @@ const createTableSQL = `
 `;
 
 async function setupDatabase() {
+  console.log("Starting database setup...");
+
   const pool = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
   });
 
   try {
-    // 기존 테이블 삭제
-    await pool.query("DROP TABLE IF EXISTS korean_servers;");
+    console.log("Connecting to database...");
+    const client = await pool.connect();
 
-    // 새 테이블 생성
-    await pool.query(createTableSQL);
+    console.log("Dropping old table if exists...");
+    await client.query("DROP TABLE IF EXISTS korean_servers;");
+
+    console.log("Creating new table...");
+    await client.query(createTableSQL);
     console.log("Database table created successfully");
+
+    client.release();
   } catch (error) {
     console.error("Error creating database table:", error);
+    throw error;
   } finally {
     await pool.end();
   }
 }
 
+const currentFile = fileURLToPath(import.meta.url);
+
 // 직접 실행된 경우에만 setupDatabase 실행
-if (process.argv[1] === new URL(import.meta.url).pathname) {
-  setupDatabase();
+if (process.argv[1] === currentFile) {
+  console.log("Running database setup directly...");
+  setupDatabase()
+    .then(() => {
+      console.log("Database setup completed successfully");
+      process.exit(0);
+    })
+    .catch((error) => {
+      console.error("Database setup failed:", error);
+      process.exit(1);
+    });
+} else {
+  console.log("Module imported, not running setup");
 }
+
+export { setupDatabase };

@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import pg from "pg";
@@ -22,6 +21,14 @@ const logger = winston.createLogger({
   ],
 });
 
+if (process.env.NODE_ENV !== "production") {
+  logger.add(
+    new winston.transports.Console({
+      format: winston.format.simple(),
+    })
+  );
+}
+
 // DB 설정
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
@@ -34,6 +41,18 @@ app.use(express.json());
 // 디스커버리 인스턴스 생성
 const discovery = new KoreanActivityPubDiscovery(pool, logger);
 
+// 루트 경로에 상태 및 기본 정보 제공
+app.get("/", (req, res) => {
+  res.json({
+    name: "Yunabuju - Korean ActivityPub Directory",
+    status: "running",
+    endpoints: {
+      servers: "/yunabuju/servers",
+    },
+    version: "1.0.0",
+  });
+});
+
 // API 라우트
 app.get("/yunabuju/servers", async (req, res) => {
   try {
@@ -41,6 +60,21 @@ app.get("/yunabuju/servers", async (req, res) => {
     res.json(servers);
   } catch (error) {
     logger.error("Error fetching servers:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// 서버 상태 체크 엔드포인트
+app.get("/yunabuju/status", async (req, res) => {
+  try {
+    const stats = {
+      status: "healthy",
+      lastUpdate: new Date().toISOString(),
+      serverCount: (await discovery.getKnownServers()).length,
+    };
+    res.json(stats);
+  } catch (error) {
+    logger.error("Error checking status:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -64,4 +98,5 @@ cron.schedule(
 const PORT = process.env.PORT || 3500;
 app.listen(PORT, () => {
   logger.info(`Server is running on port ${PORT}`);
+  console.log(`Server is running on http://localhost:${PORT}`);
 });
