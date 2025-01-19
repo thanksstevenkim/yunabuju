@@ -5,18 +5,18 @@ import { fileURLToPath } from "url";
 dotenv.config();
 
 const createTableSQL = `
- CREATE TABLE IF NOT EXISTS yunabuju_servers (
-   id SERIAL PRIMARY KEY,
-   domain VARCHAR(255) NOT NULL UNIQUE,
-   first_discovered TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-   last_checked TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-   is_active BOOLEAN DEFAULT true,
-   korean_usage_rate FLOAT,
-   description TEXT,
-   total_users INTEGER,
-   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
- );
+  CREATE TABLE IF NOT EXISTS yunabuju_servers (
+    id SERIAL PRIMARY KEY,
+    domain VARCHAR(255) NOT NULL UNIQUE,
+    first_discovered TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_checked TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT true,
+    korean_usage_rate FLOAT,
+    description TEXT,
+    total_users INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
 `;
 
 async function setupDatabase() {
@@ -31,7 +31,7 @@ async function setupDatabase() {
     const client = await pool.connect();
 
     console.log("Dropping old table if exists...");
-    await client.query("DROP TABLE IF EXISTS korean_servers;");
+    await client.query("DROP TABLE IF EXISTS yunabuju_servers;");
 
     console.log("Creating new table...");
     await client.query(createTableSQL);
