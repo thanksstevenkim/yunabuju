@@ -67,6 +67,7 @@ async function startServer() {
         status: "running",
         endpoints: {
           servers: "/yunabuju/servers",
+          serversAll: "/yunabuju/servers/all",
           discover: "/yunabuju/discover",
           status: "/yunabuju/status",
         },
@@ -74,13 +75,36 @@ async function startServer() {
       });
     });
 
-    // API 라우트
+    // API 라우트 - 기본 서버 목록 (가입 가능한 서버만)
     app.get("/yunabuju/servers", async (req, res) => {
       try {
-        const servers = await discovery.getKnownServers();
-        res.json(servers);
+        const includeClosedRegistration =
+          req.query.includeClosedRegistration === "true";
+        const servers = await discovery.getKnownServers(
+          includeClosedRegistration
+        );
+        res.json({
+          total: servers.length,
+          registration_filtered: !includeClosedRegistration,
+          servers: servers,
+        });
       } catch (error) {
         logger.error("Error fetching servers:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+
+    // API 라우트 - 모든 서버 목록
+    app.get("/yunabuju/servers/all", async (req, res) => {
+      try {
+        const servers = await discovery.getKnownServers(true);
+        res.json({
+          total: servers.length,
+          registration_filtered: false,
+          servers: servers,
+        });
+      } catch (error) {
+        logger.error("Error fetching all servers:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -90,7 +114,7 @@ async function startServer() {
       try {
         logger.info("Starting manual server discovery...");
         await discovery.startDiscovery();
-        const servers = await discovery.getKnownServers();
+        const servers = await discovery.getKnownServers(true);
         logger.info(`Discovery completed. Found ${servers.length} servers.`);
         res.json({
           message: "Discovery completed successfully",
@@ -105,10 +129,19 @@ async function startServer() {
     // 서버 상태 체크 엔드포인트
     app.get("/yunabuju/status", async (req, res) => {
       try {
+        const allServers = await discovery.getKnownServers(true);
+        const openServers = allServers.filter(
+          (server) => server.registration_open === true
+        );
+
         const stats = {
           status: "healthy",
           lastUpdate: new Date().toISOString(),
-          serverCount: (await discovery.getKnownServers()).length,
+          serverCount: {
+            total: allServers.length,
+            openRegistration: openServers.length,
+            closedRegistration: allServers.length - openServers.length,
+          },
         };
         res.json(stats);
       } catch (error) {

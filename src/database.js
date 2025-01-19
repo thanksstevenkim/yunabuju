@@ -19,6 +19,35 @@ const createTableSQL = `
   );
 `;
 
+const alterTableSQL = `
+  DO $$ 
+  BEGIN
+    -- Add software_name if not exists
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+      WHERE table_name = 'yunabuju_servers' AND column_name = 'software_name') THEN
+      ALTER TABLE yunabuju_servers ADD COLUMN software_name VARCHAR(50);
+    END IF;
+
+    -- Add software_version if not exists
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+      WHERE table_name = 'yunabuju_servers' AND column_name = 'software_version') THEN
+      ALTER TABLE yunabuju_servers ADD COLUMN software_version VARCHAR(50);
+    END IF;
+
+    -- Add registration_open if not exists
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+      WHERE table_name = 'yunabuju_servers' AND column_name = 'registration_open') THEN
+      ALTER TABLE yunabuju_servers ADD COLUMN registration_open BOOLEAN DEFAULT NULL;
+    END IF;
+
+    -- Add registration_approval_required if not exists
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+      WHERE table_name = 'yunabuju_servers' AND column_name = 'registration_approval_required') THEN
+      ALTER TABLE yunabuju_servers ADD COLUMN registration_approval_required BOOLEAN DEFAULT NULL;
+    END IF;
+  END $$;
+`;
+
 async function setupDatabase() {
   console.log("Starting database setup...");
 
@@ -30,16 +59,17 @@ async function setupDatabase() {
     console.log("Connecting to database...");
     const client = await pool.connect();
 
-    console.log("Dropping old table if exists...");
-    await client.query("DROP TABLE IF EXISTS yunabuju_servers;");
-
-    console.log("Creating new table...");
+    console.log("Creating table if not exists...");
     await client.query(createTableSQL);
-    console.log("Database table created successfully");
+    console.log("Database table checked successfully");
+
+    console.log("Adding new columns if not exist...");
+    await client.query(alterTableSQL);
+    console.log("Database columns updated successfully");
 
     client.release();
   } catch (error) {
-    console.error("Error creating database table:", error);
+    console.error("Error setting up database:", error);
     throw error;
   } finally {
     await pool.end();
