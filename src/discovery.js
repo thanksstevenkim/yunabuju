@@ -4,14 +4,7 @@ export class KoreanActivityPubDiscovery {
   constructor(dbPool, logger) {
     this.pool = dbPool;
     this.logger = logger;
-    this.seedServers = [
-      "silicon.moe",
-      "buttersc.one",
-      "uri.life",
-      "k.lapy.link",
-      "madost.one",
-      "mustard.blog",
-    ];
+    this.seedServers = ["mustard.blog"];
   }
 
   async fetchWithBackoff(url, attempts = 3) {
