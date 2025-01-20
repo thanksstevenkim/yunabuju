@@ -122,9 +122,9 @@ export class KoreanActivityPubDiscovery {
     const query = `
       UPDATE yunabuju_servers 
       SET 
-        discovery_status = $3,
+        discovery_status = $3::varchar,
         discovery_completed_at = CASE 
-          WHEN $3 IN ('completed', 'failed', 'not_korean') THEN CURRENT_TIMESTAMP 
+          WHEN $3::varchar IN ('completed', 'failed', 'not_korean') THEN CURRENT_TIMESTAMP 
           ELSE discovery_completed_at 
         END
       WHERE domain = $1 AND discovery_batch_id = $2
@@ -165,48 +165,89 @@ export class KoreanActivityPubDiscovery {
   async identifyInstanceType(domain, instanceInfo, nodeInfo) {
     let isPersonal = false;
     let instanceType = "unknown";
+    let matchedDescription = null;
 
     try {
-      // 1. 사용자 수 기반 체크
-      const userCount = instanceInfo.stats?.user_count || 0;
-      if (userCount <= 3) {
-        isPersonal = true;
-      }
-
-      // 2. 설명 기반 체크
-      const description = (instanceInfo.description || "").toLowerCase();
-      const personalKeywords = [
-        "personal",
-        "개인",
-        "individual",
-        "일인",
-        "1인",
-        "블로그",
+      // 1. 각각의 설명을 개별적으로 확인
+      const descriptions = [
+        { text: instanceInfo?.description, source: "description" },
+        { text: instanceInfo?.short_description, source: "short_description" },
+        { text: instanceInfo?.branding_server_description, source: "branding" },
+        { text: instanceInfo?.extended_description, source: "extended" },
       ];
-      if (personalKeywords.some((keyword) => description.includes(keyword))) {
-        isPersonal = true;
+
+      // 개인 서버 키워드
+      const personalKeywords = ["개인적", "개인", "1인", "비공개"];
+
+      // 각 설명을 개별적으로 확인
+      for (const desc of descriptions) {
+        if (!desc.text) continue;
+
+        const descText = desc.text.toLowerCase();
+        for (const keyword of personalKeywords) {
+          if (descText.includes(keyword)) {
+            isPersonal = true;
+            matchedDescription = {
+              source: desc.source,
+              keyword: keyword,
+              text: desc.text,
+            };
+            break;
+          }
+        }
+        if (isPersonal) break; // 하나라도 찾으면 중단
       }
 
-      // 3. 도메인 기반 체크
-      const personalDomainKeywords = ["personal", "blog", "개인"];
+      // 2. 도메인 기반 체크
+      if (!isPersonal) {
+        const personalDomainKeywords = ["personal", "blog", "개인"];
+        if (
+          personalDomainKeywords.some((keyword) =>
+            domain.toLowerCase().includes(keyword)
+          )
+        ) {
+          isPersonal = true;
+          matchedDescription = {
+            source: "domain",
+            keyword: "domain-based",
+            text: domain,
+          };
+        }
+      }
+
+      // 3. NodeInfo 기반 체크
+      if (!isPersonal && nodeInfo?.metadata?.singleUser === true) {
+        isPersonal = true;
+        matchedDescription = {
+          source: "nodeinfo",
+          keyword: "singleUser",
+          text: "nodeinfo.metadata.singleUser === true",
+        };
+      }
+
+      // 4. 사용자 수 기반 체크 (보조 지표로만 사용)
+      const userCount = instanceInfo?.stats?.user_count || 0;
+      if (!isPersonal && userCount <= 3) {
+        isPersonal = true;
+        matchedDescription = {
+          source: "user_count",
+          keyword: "low_users",
+          text: `user count: ${userCount}`,
+        };
+      }
+
+      // 5. 가입 정책 체크 (보조 지표)
       if (
-        personalDomainKeywords.some((keyword) =>
-          domain.toLowerCase().includes(keyword)
-        )
+        !isPersonal &&
+        instanceInfo?.registrations?.enabled === false &&
+        userCount <= 5
       ) {
         isPersonal = true;
-      }
-
-      // 4. NodeInfo 기반 체크
-      if (nodeInfo?.metadata?.singleUser === true) {
-        isPersonal = true;
-      }
-
-      // 5. 가입 정책 체크
-      if (instanceInfo.registrations?.enabled === false) {
-        if (userCount <= 5) {
-          isPersonal = true;
-        }
+        matchedDescription = {
+          source: "registration",
+          keyword: "closed_registration",
+          text: "closed registration with low user count",
+        };
       }
 
       // 인스턴스 유형 결정
@@ -215,14 +256,27 @@ export class KoreanActivityPubDiscovery {
         instanceType = "unknown";
       }
 
-      return { isPersonal, instanceType };
+      // 로깅
+      if (isPersonal) {
+        this.logger.debug({
+          message: "Personal instance detected",
+          domain,
+          matchedDescription,
+        });
+      }
+
+      return { isPersonal, instanceType, matchedDescription };
     } catch (error) {
       this.logger.error({
         message: "Error identifying instance type",
         domain,
         error: error.message,
       });
-      return { isPersonal: null, instanceType: "unknown" };
+      return {
+        isPersonal: null,
+        instanceType: "unknown",
+        matchedDescription: null,
+      };
     }
   }
 
@@ -451,6 +505,8 @@ export class KoreanActivityPubDiscovery {
       registrationApprovalRequired: instanceInfo.approval_required,
       totalUsers: instanceInfo.stats?.user_count,
       description: instanceInfo.description,
+      extendedDescription: instanceInfo.extended_description,
+      brandingServerDescription: instanceInfo.branding_server_description,
     };
   }
 
@@ -476,11 +532,49 @@ export class KoreanActivityPubDiscovery {
 
   async fetchInstanceInfo(domain) {
     try {
-      const response = await this.fetchWithBackoff(
+      // 기본 인스턴스 정보 가져오기
+      const instanceResponse = await this.fetchWithBackoff(
         `https://${domain}/api/v1/instance`
       );
-      return await response.json();
+      const instanceInfo = await instanceResponse.json();
+
+      // Extended information 가져오기 (/api/v2/instance)
+      try {
+        const extendedResponse = await this.fetchWithBackoff(
+          `https://${domain}/api/v2/instance`
+        );
+        const extendedInfo = await extendedResponse.json();
+
+        instanceInfo.extended_description = extendedInfo.extended_description;
+      } catch (error) {
+        this.logger.debug(
+          `Could not fetch v2 instance info for ${domain}: ${error.message}`
+        );
+      }
+
+      // 서버 브랜딩 정보 가져오기 (/api/v1/instance/branding)
+      try {
+        const brandingResponse = await this.fetchWithBackoff(
+          `https://${domain}/api/v1/instance/branding`
+        );
+        const brandingInfo = await brandingResponse.json();
+
+        // Server Description이 있을 때만 저장
+        if (brandingInfo.server_description) {
+          instanceInfo.branding_server_description =
+            brandingInfo.server_description;
+        }
+      } catch (error) {
+        this.logger.debug(
+          `Could not fetch branding info for ${domain}: ${error.message}`
+        );
+      }
+
+      return instanceInfo;
     } catch (error) {
+      this.logger.error(
+        `Error fetching instance info for ${domain}: ${error.message}`
+      );
       return null;
     }
   }
@@ -858,13 +952,13 @@ export class KoreanActivityPubDiscovery {
     const query = `
       UPDATE yunabuju_servers
       SET 
-        discovery_status = $2,
+        discovery_status = $2::varchar,
         discovery_completed_at = CASE 
-          WHEN $2 IN ('completed', 'failed') THEN CURRENT_TIMESTAMP 
+          WHEN $2::varchar IN ('completed', 'failed') THEN CURRENT_TIMESTAMP 
           ELSE discovery_completed_at 
         END,
         next_check_at = CASE
-          WHEN $2 = 'completed' THEN CURRENT_TIMESTAMP + INTERVAL '1 day'
+          WHEN $2::varchar = 'completed' THEN CURRENT_TIMESTAMP + INTERVAL '1 day'
           ELSE next_check_at
         END
       WHERE discovery_batch_id = $1
