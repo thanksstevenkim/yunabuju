@@ -1,9 +1,10 @@
-// database.js
 import pg from "pg";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 
 dotenv.config();
+
+const dropTableSQL = `DROP TABLE IF EXISTS yunabuju_servers;`;
 
 const createTableSQL = `
   CREATE TABLE IF NOT EXISTS yunabuju_servers (
@@ -29,7 +30,11 @@ const createTableSQL = `
     is_personal_instance BOOLEAN DEFAULT NULL,
     instance_type VARCHAR(20) DEFAULT 'unknown',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    discovery_batch_id VARCHAR(50),
+    discovery_status VARCHAR(20) DEFAULT 'pending',
+    discovery_started_at TIMESTAMP,
+    discovery_completed_at TIMESTAMP
   );
 `;
 
@@ -44,28 +49,11 @@ async function setupDatabase() {
     console.log("Connecting to database...");
     const client = await pool.connect();
 
-    console.log("Creating/updating table schema...");
+    console.log("Dropping existing table...");
+    await client.query(dropTableSQL);
+
+    console.log("Creating new table schema...");
     await client.query(createTableSQL);
-
-    // Run migration to add new columns
-    const migrationSQL = `
-      ALTER TABLE yunabuju_servers
-      ADD COLUMN IF NOT EXISTS software_name VARCHAR(50),
-      ADD COLUMN IF NOT EXISTS software_version VARCHAR(50),
-      ADD COLUMN IF NOT EXISTS registration_open BOOLEAN DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS registration_approval_required BOOLEAN DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS has_nodeinfo BOOLEAN DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS failed_attempts INTEGER DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS last_failed_at TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS is_korean_server BOOLEAN DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS last_korean_check TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS next_korean_check TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS is_personal_instance BOOLEAN DEFAULT NULL,
-      ADD COLUMN IF NOT EXISTS instance_type VARCHAR(20) DEFAULT 'unknown';
-    `;
-
-    await client.query(migrationSQL);
     console.log("Database setup completed successfully");
 
     client.release();

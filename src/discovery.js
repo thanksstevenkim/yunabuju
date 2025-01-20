@@ -65,6 +65,103 @@ export class KoreanActivityPubDiscovery {
     }
   }
 
+  async processPendingServers(batchId) {
+    const query = `
+      SELECT domain 
+      FROM yunabuju_servers 
+      WHERE discovery_batch_id = $1 
+        AND discovery_status = 'pending'
+      ORDER BY domain
+    `;
+
+    try {
+      const { rows } = await this.pool.query(query, [batchId]);
+      this.logger.info({
+        message: "Starting to process pending servers",
+        batchId,
+        serverCount: rows.length,
+      });
+
+      for (const row of rows) {
+        try {
+          // 상태를 in_progress로 변경
+          await this.updateServerStatus(row.domain, batchId, "in_progress");
+
+          const isKorean = await this.isKoreanInstance(row.domain);
+          if (isKorean) {
+            await this.updateServerInDb({
+              domain: row.domain,
+              isActive: true,
+              koreanUsageRate: this.koreanUsageRate,
+            });
+            await this.updateServerStatus(row.domain, batchId, "completed");
+            this.logger.info(`Added new Korean server: ${row.domain}`);
+          } else {
+            await this.updateServerStatus(row.domain, batchId, "not_korean");
+          }
+
+          // 서버당 1초 간격 유지
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        } catch (error) {
+          await this.updateServerStatus(row.domain, batchId, "failed");
+          this.logger.error(`Error processing server ${row.domain}:`, error);
+          continue;
+        }
+      }
+    } catch (error) {
+      this.logger.error({
+        message: "Error processing pending servers",
+        batchId,
+        error: error.message,
+      });
+      throw error;
+    }
+  }
+
+  async updateServerStatus(domain, batchId, status) {
+    const query = `
+      UPDATE yunabuju_servers 
+      SET 
+        discovery_status = $3,
+        discovery_completed_at = CASE 
+          WHEN $3 IN ('completed', 'failed', 'not_korean') THEN CURRENT_TIMESTAMP 
+          ELSE discovery_completed_at 
+        END
+      WHERE domain = $1 AND discovery_batch_id = $2
+    `;
+
+    try {
+      await this.pool.query(query, [domain, batchId, String(status)]);
+      this.logger.debug({
+        message: "Updated server status",
+        domain,
+        batchId,
+        status,
+      });
+    } catch (error) {
+      this.logger.error({
+        message: "Error updating server status",
+        domain,
+        batchId,
+        status,
+        error: error.message,
+      });
+      throw error;
+    }
+  }
+
+  async updateServerDiscoveryStatus(domain, batchId, status) {
+    const query = `
+      UPDATE yunabuju_servers 
+      SET 
+        discovery_status = $3,
+        discovery_completed_at = CURRENT_TIMESTAMP
+      WHERE domain = $1 AND discovery_batch_id = $2
+    `;
+
+    await this.pool.query(query, [domain, batchId, String(status)]); // status를 문자열로 변환
+  }
+
   async identifyInstanceType(domain, instanceInfo, nodeInfo) {
     let isPersonal = false;
     let instanceType = "unknown";
@@ -600,28 +697,82 @@ export class KoreanActivityPubDiscovery {
     return result.rows;
   }
 
-  async startDiscovery() {
-    const newServers = await this.discoverNewServers();
+  async startDiscovery(resumeBatchId = null) {
+    // 재개할 배치 ID가 없으면 새로운 배치 시작
+    const batchId =
+      resumeBatchId ||
+      `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-    for (const domain of newServers) {
+    try {
+      if (!resumeBatchId) {
+        // 새로운 배치 시작인 경우만 새 서버 발견
+        const newServers = await this.discoverNewServers();
+        await this.insertNewServers(batchId, newServers);
+      } else {
+        // 기존 배치 재개인 경우 로그
+        this.logger.info({
+          message: "Resuming discovery batch",
+          batchId: resumeBatchId,
+        });
+      }
+
+      // pending 상태인 서버들을 처리
+      await this.processPendingServers(batchId);
+
+      // 배치 완료 후 상태 업데이트
+      await this.updateBatchStatus(batchId, "completed");
+    } catch (error) {
+      this.logger.error({
+        message: "Discovery process error",
+        batchId,
+        error: error.message,
+      });
+      await this.updateBatchStatus(batchId, "failed");
+      throw error;
+    }
+  }
+
+  async insertNewServers(batchId, domains) {
+    const query = `
+      INSERT INTO yunabuju_servers 
+        (domain, discovery_batch_id, discovery_status, discovery_started_at)
+      VALUES 
+        ($1, $2, 'pending', CURRENT_TIMESTAMP)
+      ON CONFLICT (domain) 
+      DO UPDATE SET 
+        discovery_batch_id = $2,
+        discovery_status = CASE
+          WHEN yunabuju_servers.discovery_status IN ('failed', 'not_korean')
+             OR yunabuju_servers.next_check_at < CURRENT_TIMESTAMP
+          THEN 'pending'
+          ELSE yunabuju_servers.discovery_status
+        END,
+        discovery_started_at = CASE
+          WHEN yunabuju_servers.discovery_status IN ('failed', 'not_korean')
+             OR yunabuju_servers.next_check_at < CURRENT_TIMESTAMP
+          THEN CURRENT_TIMESTAMP
+          ELSE yunabuju_servers.discovery_started_at
+        END
+      WHERE yunabuju_servers.discovery_status IS NULL 
+         OR yunabuju_servers.discovery_status = 'failed'
+         OR yunabuju_servers.next_check_at < CURRENT_TIMESTAMP
+    `;
+
+    for (const domain of domains) {
       try {
-        // isKoreanInstance가 이미 모든 필요한 검사를 수행합니다
-        const isKorean = await this.isKoreanInstance(domain);
-
-        if (isKorean) {
-          await this.updateServerInDb({
-            domain,
-            isActive: true,
-            koreanUsageRate: this.koreanUsageRate, // 마지막으로 분석된 비율을 저장할 속성 추가 필요
-          });
-          this.logger.info(`Added new Korean server: ${domain}`);
-        }
-
-        // 서버당 1초 간격
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await this.pool.query(query, [domain, batchId]);
+        this.logger.debug({
+          message: "Inserted/updated server for batch",
+          domain,
+          batchId,
+        });
       } catch (error) {
-        this.logger.error(`Error processing server ${domain}:`, error);
-        continue;
+        this.logger.error({
+          message: "Error inserting new server",
+          domain,
+          batchId,
+          error: error.message,
+        });
       }
     }
   }
@@ -701,5 +852,112 @@ export class KoreanActivityPubDiscovery {
       });
       return false;
     }
+  }
+
+  async updateBatchStatus(batchId, status) {
+    const query = `
+      UPDATE yunabuju_servers
+      SET 
+        discovery_status = $2,
+        discovery_completed_at = CASE 
+          WHEN $2 IN ('completed', 'failed') THEN CURRENT_TIMESTAMP 
+          ELSE discovery_completed_at 
+        END,
+        next_check_at = CASE
+          WHEN $2 = 'completed' THEN CURRENT_TIMESTAMP + INTERVAL '1 day'
+          ELSE next_check_at
+        END
+      WHERE discovery_batch_id = $1
+    `;
+
+    try {
+      await this.pool.query(query, [batchId, String(status)]);
+      this.logger.info({
+        message: "Updated batch status",
+        batchId,
+        status,
+      });
+    } catch (error) {
+      this.logger.error({
+        message: "Error updating batch status",
+        batchId,
+        status,
+        error: error.message,
+      });
+      throw error;
+    }
+  }
+
+  async getLastUnfinishedBatch() {
+    const query = `
+      SELECT 
+        discovery_batch_id,
+        COUNT(*) as total_servers,
+        COUNT(*) FILTER (WHERE discovery_status = 'pending') as pending_servers,
+        MIN(discovery_started_at) as started_at,
+        MAX(discovery_completed_at) as last_completion,
+        STRING_AGG(DISTINCT discovery_status, ', ') as current_statuses
+      FROM yunabuju_servers
+      WHERE discovery_status = 'pending'
+        OR (
+          discovery_status = 'in_progress'
+          AND discovery_started_at > NOW() - INTERVAL '1 day'
+        )
+      GROUP BY discovery_batch_id
+      ORDER BY started_at DESC
+      LIMIT 1
+    `;
+
+    try {
+      const { rows } = await this.pool.query(query);
+      if (rows.length === 0) {
+        return null;
+      }
+
+      // 추가 정보 포함
+      const batch = rows[0];
+      batch.age = new Date() - new Date(batch.started_at);
+      batch.is_stalled = batch.age > 3600000; // 1시간 이상 진행 중이면 stalled로 간주
+
+      return batch;
+    } catch (error) {
+      this.logger.error({
+        message: "Error fetching unfinished batch",
+        error: error.message,
+      });
+      throw error;
+    }
+  }
+
+  async resumeDiscovery(batchId = null) {
+    if (!batchId) {
+      const lastBatch = await this.getLastUnfinishedBatch();
+      if (!lastBatch) {
+        this.logger.info("No unfinished batch found to resume");
+        return false;
+      }
+      batchId = lastBatch.discovery_batch_id;
+
+      // 오래된 배치는 새로 시작
+      if (lastBatch.is_stalled) {
+        this.logger.warn({
+          message: "Found stalled batch, starting fresh",
+          batchId: lastBatch.discovery_batch_id,
+          age: lastBatch.age,
+        });
+        return await this.startDiscovery();
+      }
+
+      this.logger.info({
+        message: "Found unfinished batch to resume",
+        batchId,
+        totalServers: lastBatch.total_servers,
+        pendingServers: lastBatch.pending_servers,
+        startedAt: lastBatch.started_at,
+      });
+    }
+
+    await this.startDiscovery(batchId);
+    return true;
   }
 }

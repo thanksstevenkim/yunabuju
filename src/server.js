@@ -69,6 +69,7 @@ async function startServer() {
           servers: "/yunabuju/servers",
           serversAll: "/yunabuju/servers/all",
           discover: "/yunabuju/discover",
+          discoverStatus: "/yunabuju/discover/status",
           status: "/yunabuju/status",
         },
         version: "1.0.0",
@@ -117,18 +118,58 @@ async function startServer() {
     // 수동으로 서버 검색을 시작하는 엔드포인트
     app.post("/yunabuju/discover", async (req, res) => {
       try {
-        logger.info("Starting manual server discovery...");
-        await discovery.startDiscovery();
+        const { resume } = req.query;
+        logger.info(
+          `${resume ? "Resuming" : "Starting"} manual server discovery...`
+        );
+
+        if (resume === "true") {
+          const result = await discovery.resumeDiscovery();
+          if (!result) {
+            return res.json({ message: "No unfinished batch found to resume" });
+          }
+        } else {
+          await discovery.startDiscovery();
+        }
+
         const servers = await discovery.getKnownServers(true, true); // 개인 인스턴스 제외
         logger.info(
-          `Discovery completed. Found ${servers.length} community servers.`
+          `Discovery ${resume ? "resumed and" : ""} completed. Found ${
+            servers.length
+          } community servers.`
         );
         res.json({
-          message: "Discovery completed successfully",
+          message: `Discovery ${
+            resume ? "resumed and" : ""
+          } completed successfully`,
           serverCount: servers.length,
         });
       } catch (error) {
         logger.error("Error in manual server discovery:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+
+    // 발견 작업 상태 확인 엔드포인트
+    app.get("/yunabuju/discover/status", async (req, res) => {
+      try {
+        const lastBatch = await discovery.getLastUnfinishedBatch();
+        if (!lastBatch) {
+          return res.json({
+            status: "no_pending_batch",
+            message: "No unfinished discovery batch found",
+          });
+        }
+
+        res.json({
+          status: "pending",
+          batchId: lastBatch.discovery_batch_id,
+          totalServers: lastBatch.total_servers,
+          pendingServers: lastBatch.pending_servers,
+          startedAt: lastBatch.started_at,
+        });
+      } catch (error) {
+        logger.error("Error checking discovery status:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
