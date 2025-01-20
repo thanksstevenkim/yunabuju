@@ -23,6 +23,9 @@ const createTableSQL = `
     failed_attempts INTEGER DEFAULT 0,
     last_failed_at TIMESTAMP,
     next_check_at TIMESTAMP,
+    is_korean_server BOOLEAN DEFAULT NULL,
+    last_korean_check TIMESTAMP,
+    next_korean_check TIMESTAMP,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
   );

@@ -111,6 +111,12 @@ export class KoreanActivityPubDiscovery {
       return false;
     }
 
+    // 한국어 서버 체크가 필요한지 확인
+    if (!(await this.shouldCheckKoreanServer(domain))) {
+      const server = await this.getServerFromDb(domain);
+      return server?.is_korean_server || false;
+    }
+
     const startTime = performance.now();
 
     try {
@@ -126,11 +132,13 @@ export class KoreanActivityPubDiscovery {
       // 한국어 지원 여부 확인 - NodeInfo가 없어도 진행
       const isKorean = await this.checkKoreanSupport(domain, nodeInfo || {});
       if (!isKorean) {
+        await this.updateKoreanServerStatus(domain, false);
         return false;
       }
 
       const koreanUsageRate = await this.analyzeKoreanUsage(domain);
       if (koreanUsageRate <= 0.3) {
+        await this.updateKoreanServerStatus(domain, false);
         return false;
       }
 
@@ -139,8 +147,10 @@ export class KoreanActivityPubDiscovery {
         isActive: true,
         koreanUsageRate,
         ...this.extractServerInfo(instanceInfo),
-        hasNodeInfo: !!nodeInfo, // NodeInfo 존재 여부 기록
+        hasNodeInfo: !!nodeInfo,
       });
+
+      await this.updateKoreanServerStatus(domain, true, koreanUsageRate);
 
       const processingTime = performance.now() - startTime;
       this.logger.info({
@@ -153,6 +163,7 @@ export class KoreanActivityPubDiscovery {
 
       return true;
     } catch (error) {
+      await this.updateKoreanServerStatus(domain, false);
       throw new Error(`Error processing ${domain}: ${error.message}`);
     }
   }
@@ -387,9 +398,9 @@ export class KoreanActivityPubDiscovery {
     const query = `
       INSERT INTO yunabuju_servers 
         (domain, is_active, korean_usage_rate, software_name, software_version,
-         registration_open, registration_approval_required, total_users,
-         description, has_nodeinfo, last_checked)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+        registration_open, registration_approval_required, total_users,
+        description, has_nodeinfo, is_korean_server, last_checked)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP)
       ON CONFLICT (domain) 
       DO UPDATE SET 
         is_active = $2,
@@ -401,6 +412,7 @@ export class KoreanActivityPubDiscovery {
         total_users = $8,
         description = $9,
         has_nodeinfo = $10,
+        is_korean_server = $11,
         last_checked = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
     `;
@@ -416,13 +428,19 @@ export class KoreanActivityPubDiscovery {
       server.totalUsers,
       server.description,
       server.hasNodeInfo,
+      server.isKoreanServer,
     ]);
   }
 
   async getKnownServers(includeClosedRegistration = false) {
     const query = includeClosedRegistration
-      ? "SELECT * FROM yunabuju_servers WHERE is_active = true ORDER BY korean_usage_rate DESC"
-      : "SELECT * FROM yunabuju_servers WHERE is_active = true AND registration_open = true ORDER BY korean_usage_rate DESC";
+      ? `SELECT * FROM yunabuju_servers 
+         WHERE is_active = true AND is_korean_server = true 
+         ORDER BY korean_usage_rate DESC`
+      : `SELECT * FROM yunabuju_servers 
+         WHERE is_active = true AND is_korean_server = true AND registration_open = true 
+         ORDER BY korean_usage_rate DESC`;
+
     const result = await this.pool.query(query);
     return result.rows;
   }
@@ -451,6 +469,39 @@ export class KoreanActivityPubDiscovery {
         continue;
       }
     }
+  }
+
+  async shouldCheckKoreanServer(domain) {
+    const server = await this.getServerFromDb(domain);
+    if (!server) return true;
+
+    // next_korean_check가 설정되어 있고, 아직 체크 시간이 되지 않았으면 캐시된 결과 사용
+    if (
+      server.next_korean_check &&
+      new Date() < new Date(server.next_korean_check)
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  async updateKoreanServerStatus(domain, isKorean, koreanUsageRate = null) {
+    const query = `
+      UPDATE yunabuju_servers 
+      SET 
+        is_korean_server = $2,
+        korean_usage_rate = $3,
+        last_korean_check = CURRENT_TIMESTAMP,
+        next_korean_check = CASE
+          WHEN $2 = false THEN CURRENT_TIMESTAMP + INTERVAL '7 days'  -- 한국어 서버가 아닌 경우 7일 후 재확인
+          ELSE NULL  -- 한국어 서버인 경우 매일 체크
+        END,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE domain = $1
+    `;
+
+    await this.pool.query(query, [domain, isKorean, koreanUsageRate]);
   }
 
   async isKoreanInstance(domain) {
