@@ -75,17 +75,20 @@ async function startServer() {
       });
     });
 
-    // API 라우트 - 기본 서버 목록 (가입 가능한 서버만)
+    // API 라우트 - 기본 서버 목록 (가입 가능한 커뮤니티 서버만)
     app.get("/yunabuju/servers", async (req, res) => {
       try {
         const includeClosedRegistration =
           req.query.includeClosedRegistration === "true";
+        // 기본적으로 개인 인스턴스는 제외
         const servers = await discovery.getKnownServers(
-          includeClosedRegistration
+          includeClosedRegistration,
+          true
         );
         res.json({
           total: servers.length,
           registration_filtered: !includeClosedRegistration,
+          personal_instances_filtered: true,
           servers: servers,
         });
       } catch (error) {
@@ -94,13 +97,15 @@ async function startServer() {
       }
     });
 
-    // API 라우트 - 모든 서버 목록
+    // API 라우트 - 모든 서버 목록 (관리자용)
     app.get("/yunabuju/servers/all", async (req, res) => {
       try {
-        const servers = await discovery.getKnownServers(true);
+        const includePersonal = req.query.includePersonal === "true";
+        const servers = await discovery.getKnownServers(true, !includePersonal);
         res.json({
           total: servers.length,
           registration_filtered: false,
+          personal_instances_filtered: !includePersonal,
           servers: servers,
         });
       } catch (error) {
@@ -114,8 +119,10 @@ async function startServer() {
       try {
         logger.info("Starting manual server discovery...");
         await discovery.startDiscovery();
-        const servers = await discovery.getKnownServers(true);
-        logger.info(`Discovery completed. Found ${servers.length} servers.`);
+        const servers = await discovery.getKnownServers(true, true); // 개인 인스턴스 제외
+        logger.info(
+          `Discovery completed. Found ${servers.length} community servers.`
+        );
         res.json({
           message: "Discovery completed successfully",
           serverCount: servers.length,
@@ -129,8 +136,14 @@ async function startServer() {
     // 서버 상태 체크 엔드포인트
     app.get("/yunabuju/status", async (req, res) => {
       try {
-        const allServers = await discovery.getKnownServers(true);
-        const openServers = allServers.filter(
+        const allServers = await discovery.getKnownServers(true, false); // 모든 서버 포함
+        const communityServers = allServers.filter(
+          (server) => !server.is_personal_instance
+        );
+        const personalServers = allServers.filter(
+          (server) => server.is_personal_instance
+        );
+        const openServers = communityServers.filter(
           (server) => server.registration_open === true
         );
 
@@ -139,8 +152,10 @@ async function startServer() {
           lastUpdate: new Date().toISOString(),
           serverCount: {
             total: allServers.length,
+            community: communityServers.length,
+            personal: personalServers.length,
             openRegistration: openServers.length,
-            closedRegistration: allServers.length - openServers.length,
+            closedRegistration: communityServers.length - openServers.length,
           },
         };
         res.json(stats);
