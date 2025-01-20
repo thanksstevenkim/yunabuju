@@ -19,6 +19,7 @@ const createTableSQL = `
     software_version VARCHAR(50),
     registration_open BOOLEAN DEFAULT NULL,
     registration_approval_required BOOLEAN DEFAULT NULL,
+    has_nodeinfo BOOLEAN DEFAULT NULL,
     failed_attempts INTEGER DEFAULT 0,
     last_failed_at TIMESTAMP,
     next_check_at TIMESTAMP,

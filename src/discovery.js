@@ -11,6 +11,7 @@ export class KoreanActivityPubDiscovery {
     this.batchDelay = process.env.BATCH_DELAY || 100;
     this.requestQueue = [];
     this.processing = false;
+    this.koreanUsageRate = 0; // 마지막으로 분석된 한국어 사용률
     this.stats = {
       totalProcessed: 0,
       successful: 0,
@@ -113,16 +114,17 @@ export class KoreanActivityPubDiscovery {
     const startTime = performance.now();
 
     try {
-      const [instanceInfo, nodeInfo] = await Promise.all([
-        this.fetchInstanceInfo(domain),
-        this.fetchNodeInfo(domain),
-      ]);
-
-      if (!instanceInfo || !nodeInfo) {
-        throw new Error("Failed to fetch server information");
+      // instance.json을 먼저 확인
+      const instanceInfo = await this.fetchInstanceInfo(domain);
+      if (!instanceInfo) {
+        throw new Error("Failed to fetch instance information");
       }
 
-      const isKorean = await this.checkKoreanSupport(domain, nodeInfo);
+      // NodeInfo는 선택적으로 확인
+      const nodeInfo = await this.fetchNodeInfo(domain);
+
+      // 한국어 지원 여부 확인 - NodeInfo가 없어도 진행
+      const isKorean = await this.checkKoreanSupport(domain, nodeInfo || {});
       if (!isKorean) {
         return false;
       }
@@ -137,6 +139,7 @@ export class KoreanActivityPubDiscovery {
         isActive: true,
         koreanUsageRate,
         ...this.extractServerInfo(instanceInfo),
+        hasNodeInfo: !!nodeInfo, // NodeInfo 존재 여부 기록
       });
 
       const processingTime = performance.now() - startTime;
@@ -145,6 +148,7 @@ export class KoreanActivityPubDiscovery {
         domain,
         koreanUsageRate,
         processingTime,
+        hasNodeInfo: !!nodeInfo,
       });
 
       return true;
@@ -384,8 +388,8 @@ export class KoreanActivityPubDiscovery {
       INSERT INTO yunabuju_servers 
         (domain, is_active, korean_usage_rate, software_name, software_version,
          registration_open, registration_approval_required, total_users,
-         description, last_checked)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
+         description, has_nodeinfo, last_checked)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
       ON CONFLICT (domain) 
       DO UPDATE SET 
         is_active = $2,
@@ -396,6 +400,7 @@ export class KoreanActivityPubDiscovery {
         registration_approval_required = $7,
         total_users = $8,
         description = $9,
+        has_nodeinfo = $10,
         last_checked = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
     `;
@@ -410,6 +415,7 @@ export class KoreanActivityPubDiscovery {
       server.registrationApprovalRequired,
       server.totalUsers,
       server.description,
+      server.hasNodeInfo,
     ]);
   }
 
@@ -426,13 +432,14 @@ export class KoreanActivityPubDiscovery {
 
     for (const domain of newServers) {
       try {
+        // isKoreanInstance가 이미 모든 필요한 검사를 수행합니다
         const isKorean = await this.isKoreanInstance(domain);
+
         if (isKorean) {
-          const koreanUsageRate = await this.analyzeKoreanUsage(domain);
           await this.updateServerInDb({
             domain,
             isActive: true,
-            koreanUsageRate,
+            koreanUsageRate: this.koreanUsageRate, // 마지막으로 분석된 비율을 저장할 속성 추가 필요
           });
           this.logger.info(`Added new Korean server: ${domain}`);
         }
@@ -441,7 +448,42 @@ export class KoreanActivityPubDiscovery {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
         this.logger.error(`Error processing server ${domain}:`, error);
+        continue;
       }
+    }
+  }
+
+  async isKoreanInstance(domain) {
+    try {
+      const nodeInfo = await this.fetchNodeInfo(domain);
+      if (!nodeInfo) {
+        this.logger.info(`No NodeInfo available for ${domain}`);
+        return false;
+      }
+
+      const isKoreanServer = await this.checkKoreanSupport(domain, nodeInfo);
+      if (!isKoreanServer) {
+        this.logger.info(`${domain} is not a Korean server`);
+        return false;
+      }
+
+      const koreanUsageRate = await this.analyzeKoreanUsage(domain);
+      this.koreanUsageRate = koreanUsageRate; // 값을 저장
+      const isKorean = koreanUsageRate > 0.3;
+
+      this.logger.info({
+        message: `Korean usage analysis for ${domain}`,
+        koreanUsageRate,
+        isKorean,
+      });
+
+      return isKorean;
+    } catch (error) {
+      this.logger.error({
+        message: `Error checking Korean instance ${domain}`,
+        error: error.message,
+      });
+      return false;
     }
   }
 }
