@@ -649,14 +649,24 @@ export class KoreanActivityPubDiscovery {
         korean_usage_rate = $3,
         last_korean_check = CURRENT_TIMESTAMP,
         next_korean_check = CASE
-          WHEN $2 = false THEN CURRENT_TIMESTAMP + INTERVAL '7 days'  -- 한국어 서버가 아닌 경우 7일 후 재확인
-          ELSE NULL  -- 한국어 서버인 경우 매일 체크
+          WHEN $2 = false THEN NULL  -- 한국어 서버가 아닌 것으로 확인되면 영구적으로 캐시
+          ELSE NULL  -- 한국어 서버인 경우도 매번 체크할 필요 없음
         END,
         updated_at = CURRENT_TIMESTAMP
       WHERE domain = $1
     `;
 
     await this.pool.query(query, [domain, isKorean, koreanUsageRate]);
+
+    this.logger.info({
+      message: `Korean server status updated`,
+      domain,
+      isKorean,
+      koreanUsageRate,
+      action: isKorean
+        ? "marked as Korean server"
+        : "marked as non-Korean server",
+    });
   }
 
   async isKoreanInstance(domain) {
