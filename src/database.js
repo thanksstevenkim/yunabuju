@@ -31,6 +31,33 @@ const createTableSQL = `
   );
 `;
 
+// 테이블이 이미 존재하는 경우 새로운 컬럼 추가
+const alterTableSQL = `
+  DO $$ 
+  BEGIN 
+    BEGIN
+      ALTER TABLE yunabuju_servers ADD COLUMN is_korean_server BOOLEAN DEFAULT NULL;
+    EXCEPTION
+      WHEN duplicate_column THEN 
+        RAISE NOTICE 'Column is_korean_server already exists';
+    END;
+    
+    BEGIN
+      ALTER TABLE yunabuju_servers ADD COLUMN last_korean_check TIMESTAMP;
+    EXCEPTION
+      WHEN duplicate_column THEN 
+        RAISE NOTICE 'Column last_korean_check already exists';
+    END;
+    
+    BEGIN
+      ALTER TABLE yunabuju_servers ADD COLUMN next_korean_check TIMESTAMP;
+    EXCEPTION
+      WHEN duplicate_column THEN 
+        RAISE NOTICE 'Column next_korean_check already exists';
+    END;
+  END $$;
+`;
+
 async function setupDatabase() {
   console.log("Starting database setup...");
 
@@ -44,6 +71,10 @@ async function setupDatabase() {
 
     console.log("Creating/updating table schema...");
     await client.query(createTableSQL);
+
+    console.log("Adding new columns if they don't exist...");
+    await client.query(alterTableSQL);
+
     console.log("Database setup completed successfully");
 
     client.release();

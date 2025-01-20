@@ -328,20 +328,98 @@ export class KoreanActivityPubDiscovery {
 
   async analyzeKoreanUsage(domain) {
     try {
-      const response = await this.fetchWithBackoff(
-        `https://${domain}/api/v1/timelines/public?local=true&limit=20`
-      );
-      const posts = await response.json();
+      // 여러 페이지의 게시물을 가져오기 위한 설정
+      const maxPosts = 50; // 분석할 최대 게시물 수 증가
+      const postsPerPage = 20;
+      let allPosts = [];
+      let nextLink = `https://${domain}/api/v1/timelines/public?local=true&limit=${postsPerPage}`;
 
-      if (!posts.length) return 0;
+      // 여러 페이지의 게시물 수집
+      while (allPosts.length < maxPosts && nextLink) {
+        const response = await this.fetchWithBackoff(nextLink);
+        const posts = await response.json();
 
-      const koreanPosts = posts.filter((post) =>
-        this.containsKorean(post.content)
-      );
-      return koreanPosts.length / posts.length;
+        if (!Array.isArray(posts) || posts.length === 0) break;
+
+        allPosts = allPosts.concat(posts);
+
+        // Link 헤더에서 다음 페이지 URL 추출
+        const linkHeader = response.headers.get("Link");
+        nextLink = this.extractNextLink(linkHeader);
+      }
+
+      if (allPosts.length === 0) {
+        // 타임라인이 비어있는 경우 다른 방법으로 확인
+        return await this.analyzeServerMetadata(domain);
+      }
+
+      const koreanPosts = allPosts.filter((post) => {
+        // HTML 태그 제거
+        const content = this.stripHtml(post.content);
+        // 이모지와 특수문자 제거
+        const cleanContent = content.replace(
+          /[\uD800-\uDBFF][\uDC00-\uDFFF]/g,
+          ""
+        );
+        return this.containsKorean(cleanContent);
+      });
+
+      return koreanPosts.length / allPosts.length;
     } catch (error) {
+      this.logger.warn(`Error in analyzeKoreanUsage for ${domain}:`, error);
+      // 타임라인 API 실패 시 서버 메타데이터로 대체 확인
+      return await this.analyzeServerMetadata(domain);
+    }
+  }
+
+  stripHtml(html) {
+    return html.replace(/<[^>]*>/g, "");
+  }
+
+  async analyzeServerMetadata(domain) {
+    try {
+      // 인스턴스 정보에서 한국어 사용 여부 확인
+      const instanceInfo = await this.fetchInstanceInfo(domain);
+      if (!instanceInfo) return 0;
+
+      let koreanPoints = 0;
+      let totalPoints = 0;
+
+      // 서버 설명에서 한국어 확인
+      if (instanceInfo.description) {
+        totalPoints++;
+        if (this.containsKorean(instanceInfo.description)) koreanPoints++;
+      }
+
+      // 서버 규칙에서 한국어 확인
+      if (Array.isArray(instanceInfo.rules)) {
+        totalPoints += instanceInfo.rules.length;
+        koreanPoints += instanceInfo.rules.filter((rule) =>
+          this.containsKorean(rule.text)
+        ).length;
+      }
+
+      // 언어 설정 확인
+      if (Array.isArray(instanceInfo.languages)) {
+        totalPoints++;
+        if (instanceInfo.languages.includes("ko")) koreanPoints++;
+      }
+
+      return totalPoints > 0 ? koreanPoints / totalPoints : 0;
+    } catch (error) {
+      this.logger.error(`Error in analyzeServerMetadata for ${domain}:`, error);
       return 0;
     }
+  }
+
+  extractNextLink(linkHeader) {
+    if (!linkHeader) return null;
+    const links = linkHeader.split(",");
+    const nextLink = links.find((link) => link.includes('rel="next"'));
+    if (!nextLink) return null;
+
+    const matches = nextLink.match(/<([^>]+)>/);
+    return matches ? matches[1] : null;
   }
 
   async discoverNewServers() {
