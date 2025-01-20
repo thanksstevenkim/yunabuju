@@ -230,6 +230,310 @@ export class KoreanActivityPubDiscovery {
     }
   }
 
+  async fetchWithBackoff(url, options = {}, attempts = 3) {
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+
+        const response = await fetch(url, {
+          ...options,
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "Yunabuju-ActivityPub-Directory/1.0",
+            ...options.headers,
+          },
+        });
+
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        return response;
+      } catch (error) {
+        if (i === attempts - 1) throw error;
+        await new Promise((resolve) =>
+          setTimeout(resolve, 1000 * Math.pow(2, i))
+        );
+      }
+    }
+  }
+
+  async shouldCheckServer(domain) {
+    const server = await this.getServerFromDb(domain);
+    if (!server) return true;
+
+    if (server.next_check_at && new Date() < new Date(server.next_check_at)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  async updateServerFailure(domain) {
+    const query = `
+      UPDATE yunabuju_servers 
+      SET 
+        failed_attempts = COALESCE(failed_attempts, 0) + 1,
+        last_failed_at = CURRENT_TIMESTAMP,
+        next_check_at = CURRENT_TIMESTAMP + (INTERVAL '1 hour' * POWER(2, LEAST(COALESCE(failed_attempts, 0), 7))),
+        is_active = false,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE domain = $1
+      RETURNING *;
+    `;
+
+    try {
+      await this.pool.query(query, [domain]);
+    } catch (error) {
+      this.logger.error({
+        message: "Failed to update server failure status",
+        domain,
+        error: error.message,
+      });
+    }
+  }
+
+  async resetServerFailure(domain) {
+    const query = `
+      UPDATE yunabuju_servers 
+      SET 
+        failed_attempts = 0,
+        last_failed_at = NULL,
+        next_check_at = NULL,
+        is_active = true,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE domain = $1;
+    `;
+
+    try {
+      await this.pool.query(query, [domain]);
+    } catch (error) {
+      this.logger.error({
+        message: "Failed to reset server failure status",
+        domain,
+        error: error.message,
+      });
+    }
+  }
+
+  containsKorean(text) {
+    if (!text) return false;
+    const koreanRegex =
+      /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uD7B0-\uD7FF]/;
+    return koreanRegex.test(text);
+  }
+
+  async checkKoreanSupport(domain, nodeInfo) {
+    try {
+      if (nodeInfo.metadata?.languages?.includes("ko")) {
+        return true;
+      }
+
+      const instanceInfo = await this.fetchInstanceInfo(domain);
+      if (instanceInfo.languages?.includes("ko")) {
+        return true;
+      }
+
+      return (
+        this.containsKorean(instanceInfo.description) ||
+        instanceInfo.rules?.some((rule) => this.containsKorean(rule.text))
+      );
+    } catch (error) {
+      return false;
+    }
+  }
+
+  extractServerInfo(instanceInfo) {
+    return {
+      softwareName: instanceInfo.software?.name,
+      softwareVersion: instanceInfo.software?.version,
+      registrationOpen: instanceInfo.registrations?.enabled,
+      registrationApprovalRequired: instanceInfo.approval_required,
+      totalUsers: instanceInfo.stats?.user_count,
+      description: instanceInfo.description,
+    };
+  }
+
+  async fetchNodeInfo(domain) {
+    try {
+      const response = await this.fetchWithBackoff(
+        `https://${domain}/.well-known/nodeinfo`
+      );
+      const links = await response.json();
+
+      const nodeInfoLink = links.links.find(
+        (link) => link.rel === "http://nodeinfo.diaspora.software/ns/schema/2.0"
+      );
+
+      if (!nodeInfoLink) return null;
+
+      const nodeInfoResponse = await this.fetchWithBackoff(nodeInfoLink.href);
+      return await nodeInfoResponse.json();
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async fetchInstanceInfo(domain) {
+    try {
+      const response = await this.fetchWithBackoff(
+        `https://${domain}/api/v1/instance`
+      );
+      return await response.json();
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async analyzeKoreanUsage(domain) {
+    try {
+      // 여러 페이지의 게시물을 가져오기 위한 설정
+      const maxPosts = 50; // 분석할 최대 게시물 수 증가
+      const postsPerPage = 20;
+      let allPosts = [];
+      let nextLink = `https://${domain}/api/v1/timelines/public?local=true&limit=${postsPerPage}`;
+
+      // 여러 페이지의 게시물 수집
+      while (allPosts.length < maxPosts && nextLink) {
+        const response = await this.fetchWithBackoff(nextLink);
+        const posts = await response.json();
+
+        if (!Array.isArray(posts) || posts.length === 0) break;
+
+        allPosts = allPosts.concat(posts);
+
+        // Link 헤더에서 다음 페이지 URL 추출
+        const linkHeader = response.headers.get("Link");
+        nextLink = this.extractNextLink(linkHeader);
+      }
+
+      if (allPosts.length === 0) {
+        // 타임라인이 비어있는 경우 다른 방법으로 확인
+        return await this.analyzeServerMetadata(domain);
+      }
+
+      const koreanPosts = allPosts.filter((post) => {
+        // HTML 태그 제거
+        const content = this.stripHtml(post.content);
+        // 이모지와 특수문자 제거
+        const cleanContent = content.replace(
+          /[\uD800-\uDBFF][\uDC00-\uDFFF]/g,
+          ""
+        );
+        return this.containsKorean(cleanContent);
+      });
+
+      return koreanPosts.length / allPosts.length;
+    } catch (error) {
+      this.logger.warn(`Error in analyzeKoreanUsage for ${domain}:`, error);
+      // 타임라인 API 실패 시 서버 메타데이터로 대체 확인
+      return await this.analyzeServerMetadata(domain);
+    }
+  }
+
+  stripHtml(html) {
+    return html.replace(/<[^>]*>/g, "");
+  }
+
+  async analyzeServerMetadata(domain) {
+    try {
+      // 인스턴스 정보에서 한국어 사용 여부 확인
+      const instanceInfo = await this.fetchInstanceInfo(domain);
+      if (!instanceInfo) return 0;
+
+      let koreanPoints = 0;
+      let totalPoints = 0;
+
+      // 서버 설명에서 한국어 확인
+      if (instanceInfo.description) {
+        totalPoints++;
+        if (this.containsKorean(instanceInfo.description)) koreanPoints++;
+      }
+
+      // 서버 규칙에서 한국어 확인
+      if (Array.isArray(instanceInfo.rules)) {
+        totalPoints += instanceInfo.rules.length;
+        koreanPoints += instanceInfo.rules.filter((rule) =>
+          this.containsKorean(rule.text)
+        ).length;
+      }
+
+      // 언어 설정 확인
+      if (Array.isArray(instanceInfo.languages)) {
+        totalPoints++;
+        if (instanceInfo.languages.includes("ko")) koreanPoints++;
+      }
+
+      return totalPoints > 0 ? koreanPoints / totalPoints : 0;
+    } catch (error) {
+      this.logger.error(`Error in analyzeServerMetadata for ${domain}:`, error);
+      return 0;
+    }
+  }
+
+  extractNextLink(linkHeader) {
+    if (!linkHeader) return null;
+    const links = linkHeader.split(",");
+    const nextLink = links.find((link) => link.includes('rel="next"'));
+    if (!nextLink) return null;
+
+    const matches = nextLink.match(/<([^>]+)>/);
+    return matches ? matches[1] : null;
+  }
+
+  async discoverNewServers() {
+    const newServers = new Set();
+
+    for (const server of this.seedServers) {
+      try {
+        const peers = await this.fetchPeers(server);
+        for (const peer of peers) {
+          if (!(await this.getServerFromDb(peer))) {
+            newServers.add(peer);
+          }
+        }
+      } catch (error) {
+        this.logger.error({
+          message: "Error discovering peers",
+          server,
+          error: error.message,
+        });
+      }
+    }
+
+    return Array.from(newServers);
+  }
+
+  async fetchPeers(server) {
+    const endpoints = [
+      `https://${server}/api/v1/instance/peers`,
+      `https://${server}/api/v1/federation/peers`,
+    ];
+
+    for (const endpoint of endpoints) {
+      try {
+        const response = await this.fetchWithBackoff(endpoint);
+        const peers = await response.json();
+        return Array.isArray(peers) ? peers : Object.keys(peers);
+      } catch (error) {
+        continue;
+      }
+    }
+
+    return [];
+  }
+
+  async getServerFromDb(domain) {
+    const result = await this.pool.query(
+      "SELECT * FROM yunabuju_servers WHERE domain = $1",
+      [domain]
+    );
+    return result.rows[0];
+  }
+
   async updateServerInDb(server) {
     const query = `
       INSERT INTO yunabuju_servers 
