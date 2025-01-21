@@ -4,8 +4,6 @@ import { fileURLToPath } from "url";
 
 dotenv.config();
 
-const dropTableSQL = `DROP TABLE IF EXISTS yunabuju_servers;`;
-
 const createTableSQL = `
   CREATE TABLE IF NOT EXISTS yunabuju_servers (
     id SERIAL PRIMARY KEY,
@@ -49,10 +47,7 @@ async function setupDatabase() {
     console.log("Connecting to database...");
     const client = await pool.connect();
 
-    console.log("Dropping existing table...");
-    await client.query(dropTableSQL);
-
-    console.log("Creating new table schema...");
+    console.log("Creating table schema if not exists...");
     await client.query(createTableSQL);
     console.log("Database setup completed successfully");
 

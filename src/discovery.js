@@ -177,7 +177,7 @@ export class KoreanActivityPubDiscovery {
       ];
 
       // 개인 서버 키워드
-      const personalKeywords = ["개인적", "개인", "1인", "비공개"];
+      const personalKeywords = ["개인적", "개인", "개인용", "1인", "비공개"];
 
       // 각 설명을 개별적으로 확인
       for (const desc of descriptions) {
@@ -531,85 +531,155 @@ export class KoreanActivityPubDiscovery {
   }
 
   async fetchInstanceInfo(domain) {
+    // NodeInfo를 기본 정보 소스로 사용
     try {
-      // 기본 인스턴스 정보 가져오기
-      const instanceResponse = await this.fetchWithBackoff(
-        `https://${domain}/api/v1/instance`
-      );
-      const instanceInfo = await instanceResponse.json();
+      const nodeInfo = await this.fetchNodeInfo(domain);
+      if (nodeInfo) {
+        // 기본 정보 구성
+        const instanceInfo = this.convertNodeInfoToInstanceInfo(nodeInfo);
 
-      // Extended information 가져오기 (/api/v2/instance)
-      try {
-        const extendedResponse = await this.fetchWithBackoff(
-          `https://${domain}/api/v2/instance`
-        );
-        const extendedInfo = await extendedResponse.json();
+        // 서버별 추가 정보 가져오기 시도
+        try {
+          const softwareName = nodeInfo.software?.name?.toLowerCase();
+          let extraInfo = {};
 
-        instanceInfo.extended_description = extendedInfo.extended_description;
-      } catch (error) {
-        this.logger.debug(
-          `Could not fetch v2 instance info for ${domain}: ${error.message}`
-        );
-      }
+          if (softwareName === "misskey") {
+            // Misskey 추가 정보
+            const response = await this.fetchWithBackoff(
+              `https://${domain}/api/meta`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({}),
+              }
+            );
+            const misskeyData = await response.json();
+            extraInfo = {
+              description: misskeyData.description || instanceInfo.description,
+              registrations: {
+                enabled: misskeyData.disableRegistration !== true,
+              },
+              rules: Array.isArray(misskeyData.policies)
+                ? misskeyData.policies.map((p) => ({ text: p }))
+                : [],
+            };
+          } else if (
+            softwareName === "mastodon" ||
+            softwareName === "pleroma"
+          ) {
+            // Mastodon과 Pleroma의 엔드포인트 시도
+            const endpoints =
+              softwareName === "pleroma"
+                ? ["/api/instance", "/api/v1/instance", "/api/v2/instance"] // Pleroma는 /api/instance를 우선
+                : ["/api/v1/instance", "/api/v2/instance", "/api/instance"]; // Mastodon은 v1을 우선
 
-      // 서버 브랜딩 정보 가져오기 (/api/v1/instance/branding)
-      try {
-        const brandingResponse = await this.fetchWithBackoff(
-          `https://${domain}/api/v1/instance/branding`
-        );
-        const brandingInfo = await brandingResponse.json();
+            let data = null;
+            for (const endpoint of endpoints) {
+              try {
+                const response = await this.fetchWithBackoff(
+                  `https://${domain}${endpoint}`
+                );
+                data = await response.json();
+                break; // 성공하면 반복 중단
+              } catch (error) {
+                this.logger.debug(
+                  `Failed to fetch ${endpoint} for ${domain}: ${error.message}`
+                );
+                continue;
+              }
+            }
 
-        // Server Description이 있을 때만 저장
-        if (brandingInfo.server_description) {
-          instanceInfo.branding_server_description =
-            brandingInfo.server_description;
+            if (!data) {
+              throw new Error("All instance API endpoints failed");
+              extraInfo = {
+                description: data.description || instanceInfo.description,
+                rules: data.rules || [],
+                registrations: {
+                  enabled: data.registrations?.enabled ?? !data.closed,
+                },
+              };
+            }
+          }
+
+          // 기본 정보와 추가 정보 병합
+          return {
+            ...instanceInfo,
+            ...extraInfo,
+          };
+        } catch (error) {
+          // 추가 정보 가져오기 실패시 기본 NodeInfo 데이터만 사용
+          this.logger.debug(
+            `Failed to fetch additional info for ${domain}: ${error.message}`
+          );
+          return instanceInfo;
         }
-      } catch (error) {
-        this.logger.debug(
-          `Could not fetch branding info for ${domain}: ${error.message}`
-        );
       }
-
-      return instanceInfo;
     } catch (error) {
-      this.logger.error(
-        `Error fetching instance info for ${domain}: ${error.message}`
+      this.logger.debug(
+        `NodeInfo fetch failed for ${domain}: ${error.message}`
       );
-      return null;
     }
+
+    throw new Error(`Failed to fetch instance info from any endpoint`);
+  }
+
+  convertNodeInfoToInstanceInfo(nodeInfo) {
+    return {
+      software: {
+        name: nodeInfo.software?.name || "unknown",
+        version: nodeInfo.software?.version,
+      },
+      stats: {
+        user_count: nodeInfo.usage?.users?.total || 0,
+      },
+      languages: nodeInfo.metadata?.languages || [],
+      registrations: {
+        enabled: nodeInfo.openRegistrations !== false,
+      },
+      description: nodeInfo.metadata?.nodeName || "",
+      rules: [],
+    };
   }
 
   async analyzeKoreanUsage(domain) {
     try {
-      // 여러 페이지의 게시물을 가져오기 위한 설정
-      const maxPosts = 50; // 분석할 최대 게시물 수 증가
-      const postsPerPage = 20;
-      let allPosts = [];
-      let nextLink = `https://${domain}/api/v1/timelines/public?local=true&limit=${postsPerPage}`;
+      const nodeInfo = await this.fetchNodeInfo(domain);
+      const softwareName = nodeInfo?.software?.name?.toLowerCase();
+      const endpoint =
+        softwareName === "misskey"
+          ? {
+              url: `https://${domain}/api/notes/local-timeline`,
+              method: "POST",
+              body: { limit: 50, withFiles: false },
+            }
+          : {
+              url: `https://${domain}/api/v1/timelines/public?local=true&limit=50`,
+              method: "GET",
+            };
 
-      // 여러 페이지의 게시물 수집
-      while (allPosts.length < maxPosts && nextLink) {
-        const response = await this.fetchWithBackoff(nextLink);
-        const posts = await response.json();
+      const response = await this.fetchWithBackoff(endpoint.url, {
+        method: endpoint.method,
+        headers: { "Content-Type": "application/json" },
+        ...(endpoint.body ? { body: JSON.stringify(endpoint.body) } : {}),
+      });
 
-        if (!Array.isArray(posts) || posts.length === 0) break;
-
-        allPosts = allPosts.concat(posts);
-
-        // Link 헤더에서 다음 페이지 URL 추출
-        const linkHeader = response.headers.get("Link");
-        nextLink = this.extractNextLink(linkHeader);
-      }
-
-      if (allPosts.length === 0) {
-        // 타임라인이 비어있는 경우 다른 방법으로 확인
+      const posts = await response.json();
+      if (!Array.isArray(posts) || posts.length === 0) {
         return await this.analyzeServerMetadata(domain);
       }
 
-      const koreanPosts = allPosts.filter((post) => {
-        // HTML 태그 제거
-        const content = this.stripHtml(post.content);
-        // 이모지와 특수문자 제거
+      const validPosts = posts.filter((post) => {
+        const content = softwareName === "misskey" ? post.text : post.content;
+        return typeof content === "string" && content.length > 0;
+      });
+
+      if (validPosts.length === 0) {
+        return await this.analyzeServerMetadata(domain);
+      }
+
+      const koreanPosts = validPosts.filter((post) => {
+        const content =
+          softwareName === "misskey" ? post.text : this.stripHtml(post.content);
         const cleanContent = content.replace(
           /[\uD800-\uDBFF][\uDC00-\uDFFF]/g,
           ""
@@ -617,10 +687,9 @@ export class KoreanActivityPubDiscovery {
         return this.containsKorean(cleanContent);
       });
 
-      return koreanPosts.length / allPosts.length;
+      return koreanPosts.length / validPosts.length;
     } catch (error) {
       this.logger.warn(`Error in analyzeKoreanUsage for ${domain}:`, error);
-      // 타임라인 API 실패 시 서버 메타데이터로 대체 확인
       return await this.analyzeServerMetadata(domain);
     }
   }
