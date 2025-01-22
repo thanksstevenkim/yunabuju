@@ -412,17 +412,6 @@ export class KoreanActivityPubDiscovery {
     }
   }
 
-  async shouldCheckServer(domain) {
-    const server = await this.getServerFromDb(domain);
-    if (!server) return true;
-
-    if (server.next_check_at && new Date() < new Date(server.next_check_at)) {
-      return false;
-    }
-
-    return true;
-  }
-
   async updateServerFailure(domain) {
     const query = `
       UPDATE yunabuju_servers 
@@ -591,14 +580,15 @@ export class KoreanActivityPubDiscovery {
 
             if (!data) {
               throw new Error("All instance API endpoints failed");
-              extraInfo = {
-                description: data.description || instanceInfo.description,
-                rules: data.rules || [],
-                registrations: {
-                  enabled: data.registrations?.enabled ?? !data.closed,
-                },
-              };
             }
+
+            extraInfo = {
+              description: data.description || instanceInfo.description,
+              rules: data.rules || [],
+              registrations: {
+                enabled: data.registrations?.enabled ?? !data.closed,
+              },
+            };
           }
 
           // 기본 정보와 추가 정보 병합
@@ -744,24 +734,47 @@ export class KoreanActivityPubDiscovery {
     return matches ? matches[1] : null;
   }
 
-  async discoverNewServers() {
+  async discoverNewServers(depth = 3) {
+    // 최대 3단계까지 탐색
     const newServers = new Set();
+    const processedServers = new Set();
 
-    for (const server of this.seedServers) {
-      try {
-        const peers = await this.fetchPeers(server);
-        for (const peer of peers) {
-          if (!(await this.getServerFromDb(peer))) {
-            newServers.add(peer);
+    // 첫 단계는 시드 서버들
+    let currentDepthServers = new Set(this.seedServers);
+
+    for (let currentDepth = 0; currentDepth < depth; currentDepth++) {
+      this.logger.info(`Discovering depth ${currentDepth + 1} servers...`);
+      const nextDepthServers = new Set();
+
+      for (const server of currentDepthServers) {
+        if (processedServers.has(server)) continue;
+        processedServers.add(server);
+
+        try {
+          const peers = await this.fetchPeers(server);
+          for (const peer of peers) {
+            if (!processedServers.has(peer)) {
+              if (!(await this.getServerFromDb(peer))) {
+                newServers.add(peer);
+              }
+              nextDepthServers.add(peer);
+            }
           }
+        } catch (error) {
+          this.logger.error({
+            message: "Error discovering peers",
+            server,
+            depth: currentDepth + 1,
+            error: error.message,
+          });
         }
-      } catch (error) {
-        this.logger.error({
-          message: "Error discovering peers",
-          server,
-          error: error.message,
-        });
+
+        // 과도한 요청 방지를 위한 지연
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
+
+      currentDepthServers = nextDepthServers;
+      if (currentDepthServers.size === 0) break; // 더 이상 새로운 서버가 없으면 중단
     }
 
     return Array.from(newServers);
