@@ -1,4 +1,5 @@
 import fetch from "node-fetch";
+import https from "https";
 import { performance } from "perf_hooks";
 
 export class KoreanActivityPubDiscovery {
@@ -382,11 +383,11 @@ export class KoreanActivityPubDiscovery {
   }
 
   async fetchWithBackoff(url, options = {}, attempts = 3) {
+    const parsedUrl = new URL(url);
     for (let i = 0; i < attempts; i++) {
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10000);
-
         const response = await fetch(url, {
           ...options,
           signal: controller.signal,
@@ -394,16 +395,41 @@ export class KoreanActivityPubDiscovery {
             "User-Agent": "Yunabuju-ActivityPub-Directory/1.0",
             ...options.headers,
           },
+          agent: new https.Agent({
+            rejectUnauthorized: false,
+            servername: parsedUrl.hostname,
+            keepAlive: true,
+            timeout: 5000,
+            ALPNProtocols: ["http/1.1"],
+            minVersion: "TLSv1.2",
+            maxVersion: "TLSv1.3",
+          }),
         });
 
         clearTimeout(timeout);
-
         if (!response.ok) {
+          if (response.status >= 500) {
+            await this.updateServerFailure(parsedUrl.hostname);
+          }
           throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        return response;
+        // JSON 응답 검증
+        const text = await response.text();
+        try {
+          if (text.includes("<!DOCTYPE")) {
+            throw new Error("Invalid response: HTML received instead of JSON");
+          }
+          const json = JSON.parse(text);
+          return json;
+        } catch (e) {
+          throw new Error(`Invalid JSON response: ${e.message}`);
+        }
       } catch (error) {
+        if (error.code === "ENOTFOUND" || error.code === "EAI_AGAIN") {
+          await this.updateServerFailure(parsedUrl.hostname);
+          return null;
+        }
         if (i === attempts - 1) throw error;
         await new Promise((resolve) =>
           setTimeout(resolve, 1000 * Math.pow(2, i))
@@ -504,17 +530,56 @@ export class KoreanActivityPubDiscovery {
       const response = await this.fetchWithBackoff(
         `https://${domain}/.well-known/nodeinfo`
       );
-      const links = await response.json();
+      const contentType = response.headers.get("content-type");
+      if (!contentType?.includes("application/json")) {
+        this.logger.debug(
+          `Invalid content type from ${domain}: ${contentType}`
+        );
+        return null;
+      }
 
-      const nodeInfoLink = links.links.find(
+      const text = await response.text();
+      let links;
+      try {
+        links = JSON.parse(text);
+      } catch (e) {
+        this.logger.debug(
+          `Invalid JSON from ${domain}: ${text.substring(0, 100)}...`
+        );
+        return null;
+      }
+
+      const nodeInfoLink = links.links?.find(
         (link) => link.rel === "http://nodeinfo.diaspora.software/ns/schema/2.0"
       );
 
       if (!nodeInfoLink) return null;
 
       const nodeInfoResponse = await this.fetchWithBackoff(nodeInfoLink.href);
-      return await nodeInfoResponse.json();
+      const nodeInfoContentType = nodeInfoResponse.headers.get("content-type");
+      if (!nodeInfoContentType?.includes("application/json")) {
+        this.logger.debug(
+          `Invalid nodeinfo content type from ${domain}: ${nodeInfoContentType}`
+        );
+        return null;
+      }
+
+      const nodeInfoText = await nodeInfoResponse.text();
+      try {
+        return JSON.parse(nodeInfoText);
+      } catch (e) {
+        this.logger.debug(
+          `Invalid nodeinfo JSON from ${domain}: ${nodeInfoText.substring(
+            0,
+            100
+          )}...`
+        );
+        return null;
+      }
     } catch (error) {
+      this.logger.debug(
+        `Error fetching nodeinfo from ${domain}: ${error.message}`
+      );
       return null;
     }
   }
@@ -871,114 +936,108 @@ export class KoreanActivityPubDiscovery {
     return result.rows[0];
   }
 
-  // discovery.js 내 fetchPeers 메서드 수정
   async fetchPeers(servers, lastProcessedIndex = 0) {
-    const batchSize = 20;
+    const batchSize = 50;
     const allPeers = new Set();
     const serverArray = Array.isArray(servers) ? servers : [servers];
 
-    try {
-      const progress = await this.getDiscoveryProgress();
-      if (progress && progress.current_server) {
-        lastProcessedIndex = progress.last_processed_index;
-        if (progress.current_peers) {
-          progress.current_peers.forEach((peer) => allPeers.add(peer));
-        }
-      }
+    const tryAllEndpoints = async (server) => {
+      this.logger.info(`Fetching peers from ${server}`);
 
-      for (let i = lastProcessedIndex; i < serverArray.length; i += batchSize) {
-        const batch = serverArray.slice(i, i + batchSize);
+      try {
+        // 먼저 nodeinfo로 서버 타입 확인
+        const nodeInfoResponse = await this.fetchWithBackoff(
+          `https://${server}/.well-known/nodeinfo`
+        );
+        const nodeInfoData = await nodeInfoResponse.json();
 
-        const batchResults = await Promise.all(
-          batch.map(async (server) => {
-            const endpoints = [
-              // Mastodon/Pleroma 스타일
-              `https://${server}/api/v1/instance/peers`,
-              `https://${server}/api/v1/federation/peers`,
-              // Misskey 스타일
+        let endpoints;
+        const nodeInfoLink = nodeInfoData.links.find(
+          (link) =>
+            link.rel === "http://nodeinfo.diaspora.software/ns/schema/2.0"
+        );
+
+        if (nodeInfoLink) {
+          const nodeInfo = await (
+            await this.fetchWithBackoff(nodeInfoLink.href)
+          ).json();
+          const software = nodeInfo.software?.name?.toLowerCase();
+
+          if (software === "misskey") {
+            endpoints = [
               {
                 url: `https://${server}/api/federation/instances`,
                 method: "POST",
                 body: { limit: 100, offset: 0, sort: "+id" },
               },
-              // NodeInfo를 통한 피어 목록 시도
-              `https://${server}/nodeinfo/2.0.json`,
             ];
+          } else if (software === "mastodon") {
+            endpoints = [`https://${server}/api/v1/instance/peers`];
+          } else if (software === "pleroma") {
+            endpoints = [`https://${server}/api/instance/peers`];
+          } else {
+            endpoints = [
+              `https://${server}/api/v1/instance/peers`,
+              `https://${server}/api/instance/peers`,
+            ];
+          }
+        }
 
-            for (const endpoint of endpoints) {
-              try {
-                let response;
-                if (typeof endpoint === "string") {
-                  response = await this.fetchWithBackoff(endpoint);
-                } else {
-                  response = await this.fetchWithBackoff(endpoint.url, {
+        for (const endpoint of endpoints || []) {
+          try {
+            const url = typeof endpoint === "string" ? endpoint : endpoint.url;
+            const response =
+              typeof endpoint === "string"
+                ? await this.fetchWithBackoff(url)
+                : await this.fetchWithBackoff(url, {
                     method: endpoint.method,
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(endpoint.body),
                   });
-                }
 
-                const data = await response.json();
-                let peerList = [];
+            const data = await response.json();
 
-                if (Array.isArray(data)) {
-                  // Mastodon/Pleroma 스타일 응답
-                  peerList = data;
-                } else if (data.instances) {
-                  // Misskey 스타일 응답
-                  peerList = data.instances.map((instance) => instance.host);
-                } else if (data.metadata?.peers) {
-                  // NodeInfo 스타일 응답
-                  peerList = data.metadata.peers;
-                }
+            let peers = [];
+            if (Array.isArray(data)) peers = data;
+            else if (data.instances) peers = data.instances.map((i) => i.host);
 
-                // 진행 상태 저장
-                await this.saveDiscoveryProgress(
-                  server,
-                  i + batch.indexOf(server),
-                  Array.from(allPeers)
-                );
-
-                this.logger.info({
-                  message: "Fetched peers successfully",
-                  server,
-                  endpoint:
-                    typeof endpoint === "string" ? endpoint : endpoint.url,
-                  peerCount: peerList.length,
-                });
-
-                return peerList;
-              } catch (error) {
-                this.logger.debug(
-                  `Failed to fetch peers from ${
-                    typeof endpoint === "string" ? endpoint : endpoint.url
-                  }: ${error.message}`
-                );
-                continue;
-              }
+            if (peers.length > 0) {
+              this.logger.info(`Found ${peers.length} peers from ${url}`);
+              return peers;
             }
-            return [];
-          })
+          } catch (error) {
+            this.logger.debug(
+              `Failed endpoint ${
+                typeof endpoint === "string" ? endpoint : endpoint.url
+              }: ${error.message}`
+            );
+          }
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to fetch nodeinfo from ${server}: ${error.message}`
         );
-
-        batchResults.flat().forEach((peer) => allPeers.add(peer));
-        await new Promise((resolve) => setTimeout(resolve, 100));
       }
+      return [];
+    };
 
-      await this.saveDiscoveryProgress(null, 0, []);
-
-      return {
-        peers: Array.from(allPeers),
-        lastProcessedIndex: serverArray.length,
-      };
-    } catch (error) {
-      await this.saveDiscoveryProgress(
-        null,
-        lastProcessedIndex,
-        Array.from(allPeers)
+    for (let i = lastProcessedIndex; i < serverArray.length; i += batchSize) {
+      const batch = serverArray.slice(i, i + batchSize);
+      const batchResults = await Promise.all(
+        batch.map((server) => tryAllEndpoints(server))
       );
-      throw error;
+
+      const newPeers = batchResults.flat();
+      newPeers.forEach((peer) => allPeers.add(peer));
+
+      this.logger.info(`Found ${newPeers.length} new peers in this batch`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
+
+    return {
+      peers: Array.from(allPeers),
+      lastProcessedIndex: serverArray.length,
+    };
   }
 
   async getServerFromDb(domain) {
