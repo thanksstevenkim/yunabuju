@@ -734,138 +734,251 @@ export class KoreanActivityPubDiscovery {
     return matches ? matches[1] : null;
   }
 
-  async discoverNewServers(depth = 3) {
-    const newServers = new Set();
-    const processedServers = new Set();
-    let currentDepthServers = new Set(this.seedServers);
+  async discoverNewServers(
+    depth = 2,
+    currentDepth = 0,
+    processedServers = new Set(),
+    newServers = new Set(),
+    lastProcessedIndex = 0
+  ) {
+    try {
+      let currentDepthServers =
+        currentDepth === 0 ? new Set(this.seedServers) : new Set();
 
-    this.logger.info({
-      message: "Starting server discovery",
-      seedServers: Array.from(this.seedServers),
-      maxDepth: depth,
-    });
-
-    for (let currentDepth = 0; currentDepth < depth; currentDepth++) {
-      const currentServers = Array.from(currentDepthServers);
       this.logger.info({
-        message: `Starting depth ${currentDepth + 1} discovery`,
-        depth: currentDepth + 1,
-        serversToProcess: currentServers.length,
-        processedSoFar: processedServers.size,
-        newServersFound: newServers.size,
-        currentServers,
+        message: "Starting/Resuming server discovery",
+        currentDepth,
+        processedCount: processedServers.size,
+        newServersCount: newServers.size,
+        lastProcessedIndex,
       });
 
-      const nextDepthServers = new Set();
-      const unprocessedServers = currentServers.filter(
-        (server) => !processedServers.has(server)
-      );
+      for (let d = currentDepth; d < depth; d++) {
+        const currentServers = Array.from(currentDepthServers);
+        if (currentServers.length === 0) break;
 
-      if (unprocessedServers.length > 0) {
-        try {
-          const peers = await this.fetchPeers(unprocessedServers);
+        const unprocessedServers = currentServers.filter(
+          (server) => !processedServers.has(server)
+        );
+
+        if (unprocessedServers.length > 0) {
+          const { peers, lastProcessedIndex: newIndex } = await this.fetchPeers(
+            unprocessedServers,
+            lastProcessedIndex
+          );
 
           for (const peer of peers) {
             if (!processedServers.has(peer)) {
               if (!(await this.getServerFromDb(peer))) {
                 newServers.add(peer);
-                this.logger.debug({
-                  message: "Found new server",
-                  peer,
-                  depth: currentDepth + 1,
-                });
               }
-              nextDepthServers.add(peer);
+              currentDepthServers.add(peer);
             }
           }
-        } catch (error) {
-          this.logger.error({
-            message: "Error discovering peers",
-            depth: currentDepth + 1,
-            error: error.message,
+
+          // 현재 상태 저장
+          await this.saveDiscoveryState({
+            currentDepth: d,
+            processedServers: Array.from(processedServers),
+            newServers: Array.from(newServers),
+            lastProcessedIndex: newIndex,
           });
         }
+
+        unprocessedServers.forEach((server) => processedServers.add(server));
+
+        this.logger.info({
+          message: `Completed depth ${d + 1}`,
+          newServersFound: newServers.size,
+          totalProcessed: processedServers.size,
+        });
       }
 
-      unprocessedServers.forEach((server) => processedServers.add(server));
-
-      this.logger.info({
-        message: `Completed depth ${currentDepth + 1} discovery`,
-        depth: currentDepth + 1,
-        processedInThisDepth: currentServers.length,
-        newServersInThisDepth: nextDepthServers.size,
-        totalProcessed: processedServers.size,
-        totalNewServers: newServers.size,
+      return Array.from(newServers);
+    } catch (error) {
+      // 현재 상태 저장
+      await this.saveDiscoveryState({
+        currentDepth,
+        processedServers: Array.from(processedServers),
+        newServers: Array.from(newServers),
+        lastProcessedIndex,
       });
 
-      currentDepthServers = nextDepthServers;
-      if (currentDepthServers.size === 0) {
-        this.logger.info({
-          message: "No more servers to process at next depth",
-          stoppingAtDepth: currentDepth + 1,
-        });
-        break;
-      }
+      throw error;
     }
-
-    const discoveredServers = Array.from(newServers);
-    this.logger.info({
-      message: "Server discovery completed",
-      totalServersDiscovered: discoveredServers.length,
-      totalServersProcessed: processedServers.size,
-      finalDepthReached: processedServers.size > 0,
-    });
-
-    return discoveredServers;
   }
 
-  async fetchPeers(servers) {
+  async saveDiscoveryState(state) {
+    const query = `
+      INSERT INTO yunabuju_discovery_state (
+        current_depth, processed_servers, new_servers, 
+        last_processed_index, current_peers, current_server,
+        updated_at
+      ) VALUES ($1, $2::text[], $3::text[], $4, $5::text[], $6, CURRENT_TIMESTAMP)
+      ON CONFLICT (id) DO UPDATE SET
+        current_depth = $1,
+        processed_servers = $2::text[],
+        new_servers = $3::text[],
+        last_processed_index = $4,
+        current_peers = $5::text[],
+        current_server = $6,
+        updated_at = CURRENT_TIMESTAMP`;
+
+    await this.pool.query(query, [
+      state.currentDepth,
+      state.processedServers,
+      state.newServers,
+      state.lastProcessedIndex,
+      state.currentPeers || [],
+      state.currentServer,
+    ]);
+  }
+
+  async getDiscoveryState() {
+    const query = `
+      SELECT * FROM yunabuju_discovery_state 
+      WHERE updated_at > NOW() - INTERVAL '1 day'
+      ORDER BY updated_at DESC 
+      LIMIT 1
+    `;
+
+    const result = await this.pool.query(query);
+    return result.rows[0];
+  }
+
+  async saveDiscoveryProgress(server, lastPeerIndex, currentPeers) {
+    const query = `
+      UPDATE yunabuju_discovery_state 
+      SET 
+        last_processed_index = $1,
+        current_peers = $2,
+        current_server = $3,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+    `;
+
+    await this.pool.query(query, [lastPeerIndex, currentPeers, server]);
+  }
+
+  async getDiscoveryProgress() {
+    const query = `
+      SELECT last_processed_index, current_peers, current_server 
+      FROM yunabuju_discovery_state 
+      WHERE id = 1
+    `;
+
+    const result = await this.pool.query(query);
+    return result.rows[0];
+  }
+
+  // discovery.js 내 fetchPeers 메서드 수정
+  async fetchPeers(servers, lastProcessedIndex = 0) {
     const batchSize = 20;
     const allPeers = new Set();
     const serverArray = Array.isArray(servers) ? servers : [servers];
 
-    for (let i = 0; i < serverArray.length; i += batchSize) {
-      const batch = serverArray.slice(i, i + batchSize);
+    try {
+      const progress = await this.getDiscoveryProgress();
+      if (progress && progress.current_server) {
+        lastProcessedIndex = progress.last_processed_index;
+        if (progress.current_peers) {
+          progress.current_peers.forEach((peer) => allPeers.add(peer));
+        }
+      }
 
-      const batchResults = await Promise.all(
-        batch.map(async (server) => {
-          const endpoints = [
-            `https://${server}/api/v1/instance/peers`,
-            `https://${server}/api/v1/federation/peers`,
-          ];
+      for (let i = lastProcessedIndex; i < serverArray.length; i += batchSize) {
+        const batch = serverArray.slice(i, i + batchSize);
 
-          for (const endpoint of endpoints) {
-            try {
-              const response = await this.fetchWithBackoff(endpoint);
-              const peers = await response.json();
-              const peerList = Array.isArray(peers)
-                ? peers
-                : Object.keys(peers);
+        const batchResults = await Promise.all(
+          batch.map(async (server) => {
+            const endpoints = [
+              // Mastodon/Pleroma 스타일
+              `https://${server}/api/v1/instance/peers`,
+              `https://${server}/api/v1/federation/peers`,
+              // Misskey 스타일
+              {
+                url: `https://${server}/api/federation/instances`,
+                method: "POST",
+                body: { limit: 100, offset: 0, sort: "+id" },
+              },
+              // NodeInfo를 통한 피어 목록 시도
+              `https://${server}/nodeinfo/2.0.json`,
+            ];
 
-              this.logger.info({
-                message: "Fetched peers for server",
-                server,
-                endpoint,
-                peersFound: peerList.length,
-              });
+            for (const endpoint of endpoints) {
+              try {
+                let response;
+                if (typeof endpoint === "string") {
+                  response = await this.fetchWithBackoff(endpoint);
+                } else {
+                  response = await this.fetchWithBackoff(endpoint.url, {
+                    method: endpoint.method,
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(endpoint.body),
+                  });
+                }
 
-              return peerList;
-            } catch (error) {
-              this.logger.debug(
-                `Failed to fetch peers from ${endpoint}: ${error.message}`
-              );
-              continue;
+                const data = await response.json();
+                let peerList = [];
+
+                if (Array.isArray(data)) {
+                  // Mastodon/Pleroma 스타일 응답
+                  peerList = data;
+                } else if (data.instances) {
+                  // Misskey 스타일 응답
+                  peerList = data.instances.map((instance) => instance.host);
+                } else if (data.metadata?.peers) {
+                  // NodeInfo 스타일 응답
+                  peerList = data.metadata.peers;
+                }
+
+                // 진행 상태 저장
+                await this.saveDiscoveryProgress(
+                  server,
+                  i + batch.indexOf(server),
+                  Array.from(allPeers)
+                );
+
+                this.logger.info({
+                  message: "Fetched peers successfully",
+                  server,
+                  endpoint:
+                    typeof endpoint === "string" ? endpoint : endpoint.url,
+                  peerCount: peerList.length,
+                });
+
+                return peerList;
+              } catch (error) {
+                this.logger.debug(
+                  `Failed to fetch peers from ${
+                    typeof endpoint === "string" ? endpoint : endpoint.url
+                  }: ${error.message}`
+                );
+                continue;
+              }
             }
-          }
-          return [];
-        })
+            return [];
+          })
+        );
+
+        batchResults.flat().forEach((peer) => allPeers.add(peer));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      await this.saveDiscoveryProgress(null, 0, []);
+
+      return {
+        peers: Array.from(allPeers),
+        lastProcessedIndex: serverArray.length,
+      };
+    } catch (error) {
+      await this.saveDiscoveryProgress(
+        null,
+        lastProcessedIndex,
+        Array.from(allPeers)
       );
-
-      batchResults.flat().forEach((peer) => allPeers.add(peer));
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      throw error;
     }
-
-    return Array.from(allPeers);
   }
 
   async getServerFromDb(domain) {

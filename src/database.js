@@ -36,6 +36,21 @@ const createTableSQL = `
   );
 `;
 
+const createDiscoveryStateTableSQL = `
+  CREATE TABLE IF NOT EXISTS yunabuju_discovery_state (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    current_depth INTEGER DEFAULT 0,
+    processed_servers TEXT[] DEFAULT '{}',
+    new_servers TEXT[] DEFAULT '{}',
+    last_processed_index INTEGER DEFAULT 0,
+    current_peers TEXT[] DEFAULT '{}',
+    current_server VARCHAR(255),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT single_row CHECK (id = 1)
+  );
+`;
+
 async function setupDatabase() {
   console.log("Starting database setup...");
 
@@ -47,8 +62,31 @@ async function setupDatabase() {
     console.log("Connecting to database...");
     const client = await pool.connect();
 
-    console.log("Creating table schema if not exists...");
+    console.log("Creating table schemas if not exists...");
     await client.query(createTableSQL);
+    await client.query(createDiscoveryStateTableSQL);
+
+    // Add new columns if they don't exist
+    const alterTableSQL = `
+      DO $$ 
+      BEGIN 
+        BEGIN
+          ALTER TABLE yunabuju_discovery_state 
+            ADD COLUMN current_peers TEXT[] DEFAULT '{}';
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+        
+        BEGIN
+          ALTER TABLE yunabuju_discovery_state 
+            ADD COLUMN current_server VARCHAR(255);
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+      END $$;
+    `;
+    await client.query(alterTableSQL);
+
     console.log("Database setup completed successfully");
 
     client.release();

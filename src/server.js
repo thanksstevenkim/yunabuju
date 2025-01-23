@@ -60,6 +60,11 @@ async function startServer() {
     // 디스커버리 인스턴스 생성
     const discovery = new KoreanActivityPubDiscovery(pool, logger);
 
+    // resume 명령어 체크
+    if (process.argv.includes("resume")) {
+      await discovery.resumeDiscovery();
+    }
+
     // 루트 경로에 상태 및 기본 정보 제공
     app.get("/", (req, res) => {
       res.json({
