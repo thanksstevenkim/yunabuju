@@ -735,27 +735,45 @@ export class KoreanActivityPubDiscovery {
   }
 
   async discoverNewServers(depth = 3) {
-    // 최대 3단계까지 탐색
     const newServers = new Set();
     const processedServers = new Set();
-
-    // 첫 단계는 시드 서버들
     let currentDepthServers = new Set(this.seedServers);
 
+    this.logger.info({
+      message: "Starting server discovery",
+      seedServers: Array.from(this.seedServers),
+      maxDepth: depth,
+    });
+
     for (let currentDepth = 0; currentDepth < depth; currentDepth++) {
-      this.logger.info(`Discovering depth ${currentDepth + 1} servers...`);
+      const currentServers = Array.from(currentDepthServers);
+      this.logger.info({
+        message: `Starting depth ${currentDepth + 1} discovery`,
+        depth: currentDepth + 1,
+        serversToProcess: currentServers.length,
+        processedSoFar: processedServers.size,
+        newServersFound: newServers.size,
+        currentServers,
+      });
+
       const nextDepthServers = new Set();
+      const unprocessedServers = currentServers.filter(
+        (server) => !processedServers.has(server)
+      );
 
-      for (const server of currentDepthServers) {
-        if (processedServers.has(server)) continue;
-        processedServers.add(server);
-
+      if (unprocessedServers.length > 0) {
         try {
-          const peers = await this.fetchPeers(server);
+          const peers = await this.fetchPeers(unprocessedServers);
+
           for (const peer of peers) {
             if (!processedServers.has(peer)) {
               if (!(await this.getServerFromDb(peer))) {
                 newServers.add(peer);
+                this.logger.debug({
+                  message: "Found new server",
+                  peer,
+                  depth: currentDepth + 1,
+                });
               }
               nextDepthServers.add(peer);
             }
@@ -763,40 +781,91 @@ export class KoreanActivityPubDiscovery {
         } catch (error) {
           this.logger.error({
             message: "Error discovering peers",
-            server,
             depth: currentDepth + 1,
             error: error.message,
           });
         }
-
-        // 과도한 요청 방지를 위한 지연
-        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
+
+      unprocessedServers.forEach((server) => processedServers.add(server));
+
+      this.logger.info({
+        message: `Completed depth ${currentDepth + 1} discovery`,
+        depth: currentDepth + 1,
+        processedInThisDepth: currentServers.length,
+        newServersInThisDepth: nextDepthServers.size,
+        totalProcessed: processedServers.size,
+        totalNewServers: newServers.size,
+      });
 
       currentDepthServers = nextDepthServers;
-      if (currentDepthServers.size === 0) break; // 더 이상 새로운 서버가 없으면 중단
-    }
-
-    return Array.from(newServers);
-  }
-
-  async fetchPeers(server) {
-    const endpoints = [
-      `https://${server}/api/v1/instance/peers`,
-      `https://${server}/api/v1/federation/peers`,
-    ];
-
-    for (const endpoint of endpoints) {
-      try {
-        const response = await this.fetchWithBackoff(endpoint);
-        const peers = await response.json();
-        return Array.isArray(peers) ? peers : Object.keys(peers);
-      } catch (error) {
-        continue;
+      if (currentDepthServers.size === 0) {
+        this.logger.info({
+          message: "No more servers to process at next depth",
+          stoppingAtDepth: currentDepth + 1,
+        });
+        break;
       }
     }
 
-    return [];
+    const discoveredServers = Array.from(newServers);
+    this.logger.info({
+      message: "Server discovery completed",
+      totalServersDiscovered: discoveredServers.length,
+      totalServersProcessed: processedServers.size,
+      finalDepthReached: processedServers.size > 0,
+    });
+
+    return discoveredServers;
+  }
+
+  async fetchPeers(servers) {
+    const batchSize = 20;
+    const allPeers = new Set();
+    const serverArray = Array.isArray(servers) ? servers : [servers];
+
+    for (let i = 0; i < serverArray.length; i += batchSize) {
+      const batch = serverArray.slice(i, i + batchSize);
+
+      const batchResults = await Promise.all(
+        batch.map(async (server) => {
+          const endpoints = [
+            `https://${server}/api/v1/instance/peers`,
+            `https://${server}/api/v1/federation/peers`,
+          ];
+
+          for (const endpoint of endpoints) {
+            try {
+              const response = await this.fetchWithBackoff(endpoint);
+              const peers = await response.json();
+              const peerList = Array.isArray(peers)
+                ? peers
+                : Object.keys(peers);
+
+              this.logger.info({
+                message: "Fetched peers for server",
+                server,
+                endpoint,
+                peersFound: peerList.length,
+              });
+
+              return peerList;
+            } catch (error) {
+              this.logger.debug(
+                `Failed to fetch peers from ${endpoint}: ${error.message}`
+              );
+              continue;
+            }
+          }
+          return [];
+        })
+      );
+
+      batchResults.flat().forEach((peer) => allPeers.add(peer));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    return Array.from(allPeers);
   }
 
   async getServerFromDb(domain) {
@@ -873,30 +942,81 @@ export class KoreanActivityPubDiscovery {
     return result.rows;
   }
 
-  async startDiscovery(resumeBatchId = null) {
-    // 재개할 배치 ID가 없으면 새로운 배치 시작
-    const batchId =
-      resumeBatchId ||
-      `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  async startDiscovery(batchId = null) {
+    batchId =
+      batchId || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const batchSize = 50;
+    this.concurrentRequests = 20; // Increased from 5
 
     try {
-      if (!resumeBatchId) {
-        // 새로운 배치 시작인 경우만 새 서버 발견
-        const newServers = await this.discoverNewServers();
-        await this.insertNewServers(batchId, newServers);
-      } else {
-        // 기존 배치 재개인 경우 로그
-        this.logger.info({
-          message: "Resuming discovery batch",
-          batchId: resumeBatchId,
-        });
+      const servers = await this.discoverNewServers(2); // Reduced depth
+      const batches = [];
+
+      for (let i = 0; i < servers.length; i += batchSize) {
+        batches.push(servers.slice(i, i + batchSize));
       }
 
-      // pending 상태인 서버들을 처리
-      await this.processPendingServers(batchId);
+      for (const batch of batches) {
+        const processingPromises = batch.map(async (domain) => {
+          try {
+            // Skip if already checked and confirmed non-Korean
+            const existingServer = await this.getServerFromDb(domain);
+            if (existingServer && existingServer.is_korean_server === false) {
+              return;
+            }
 
-      // 배치 완료 후 상태 업데이트
+            // Quick Korean check before detailed processing
+            const isKorean = await this.isKoreanInstance(domain);
+            if (!isKorean) {
+              await this.updateServerInDb({
+                domain,
+                isActive: true,
+                isKoreanServer: false,
+                koreanUsageRate: this.koreanUsageRate,
+                lastChecked: new Date(),
+              });
+              return;
+            }
+
+            // Proceed with detailed server info gathering for Korean servers
+            const nodeInfo = await this.fetchNodeInfo(domain);
+            const instanceInfo = await this.fetchInstanceInfo(domain);
+            const { isPersonal, instanceType } =
+              await this.identifyInstanceType(domain, instanceInfo, nodeInfo);
+
+            await this.updateServerInDb({
+              domain,
+              isActive: true,
+              isKoreanServer: true,
+              koreanUsageRate: this.koreanUsageRate,
+              ...this.extractServerInfo(instanceInfo),
+              hasNodeInfo: !!nodeInfo,
+              isPersonalInstance: isPersonal,
+              instanceType,
+            });
+
+            this.logger.info({
+              message: "Korean server processed",
+              domain,
+              koreanUsageRate: this.koreanUsageRate,
+              instanceType,
+            });
+          } catch (error) {
+            this.logger.error({
+              message: "Error processing server",
+              domain,
+              error: error.message,
+            });
+            await this.updateServerFailure(domain);
+          }
+        });
+
+        await Promise.all(processingPromises);
+      }
+
       await this.updateBatchStatus(batchId, "completed");
+
+      return batchId;
     } catch (error) {
       this.logger.error({
         message: "Discovery process error",
