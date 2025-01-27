@@ -66,15 +66,16 @@ export class KoreanActivityPubDiscovery {
     }
   }
 
+  // discovery.js의 processPendingServers 메서드 수정
   async processPendingServers(batchId) {
     const BATCH_SIZE = 50;
     const query = `
-      SELECT domain 
-      FROM yunabuju_servers 
-      WHERE discovery_batch_id = $1 
-        AND discovery_status = 'pending'
-      ORDER BY domain
-    `;
+    SELECT domain 
+    FROM yunabuju_servers 
+    WHERE discovery_batch_id = $1 
+      AND discovery_status = 'pending'
+    ORDER BY domain
+  `;
 
     try {
       const { rows } = await this.pool.query(query, [batchId]);
@@ -82,14 +83,35 @@ export class KoreanActivityPubDiscovery {
         message: "Starting to process pending servers",
         batchId,
         serverCount: rows.length,
+        timestamp: new Date().toISOString(),
       });
+
+      let processedCount = 0;
+      let successCount = 0;
+      let failCount = 0;
+      let notKoreanCount = 0;
 
       for (let i = 0; i < rows.length; i += BATCH_SIZE) {
         const batch = rows.slice(i, i + BATCH_SIZE);
 
+        this.logger.info({
+          message: "Processing batch",
+          batchNumber: Math.floor(i / BATCH_SIZE) + 1,
+          totalBatches: Math.ceil(rows.length / BATCH_SIZE),
+          batchSize: batch.length,
+          timestamp: new Date().toISOString(),
+        });
+
         await Promise.all(
           batch.map(async (row) => {
             try {
+              this.logger.info({
+                message: "Starting server verification",
+                domain: row.domain,
+                status: "in_progress",
+                timestamp: new Date().toISOString(),
+              });
+
               await this.updateServerStatus(row.domain, batchId, "in_progress");
 
               const isKorean = await this.isKoreanInstance(row.domain);
@@ -101,6 +123,12 @@ export class KoreanActivityPubDiscovery {
                   koreanUsageRate: this.koreanUsageRate,
                   lastChecked: new Date(),
                   discovery_status: "not_korean",
+                });
+                notKoreanCount++;
+                this.logger.info({
+                  message: "Server verified as non-Korean",
+                  domain: row.domain,
+                  timestamp: new Date().toISOString(),
                 });
                 return;
               }
@@ -126,17 +154,21 @@ export class KoreanActivityPubDiscovery {
                 discovery_status: "completed",
               });
 
+              successCount++;
               this.logger.info({
-                message: "Korean server processed",
+                message: "Server verification completed",
                 domain: row.domain,
                 koreanUsageRate: this.koreanUsageRate,
                 instanceType,
+                timestamp: new Date().toISOString(),
               });
             } catch (error) {
+              failCount++;
               this.logger.error({
-                message: "Error processing server",
+                message: "Server verification failed",
                 domain: row.domain,
                 error: error.message,
+                timestamp: new Date().toISOString(),
               });
               await this.updateServerInDb({
                 domain: row.domain,
@@ -144,23 +176,38 @@ export class KoreanActivityPubDiscovery {
                 discovery_status: "failed",
               });
             }
+            processedCount++;
           })
         );
 
         this.logger.info({
           message: "Batch progress",
-          processedCount: Math.min(i + BATCH_SIZE, rows.length),
-          totalCount: rows.length,
-          remainingCount: Math.max(rows.length - (i + BATCH_SIZE), 0),
+          processedCount,
+          successCount,
+          failCount,
+          notKoreanCount,
+          remainingCount: rows.length - processedCount,
+          timestamp: new Date().toISOString(),
         });
 
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
+
+      this.logger.info({
+        message: "Server processing completed",
+        batchId,
+        totalProcessed: processedCount,
+        successful: successCount,
+        failed: failCount,
+        notKorean: notKoreanCount,
+        timestamp: new Date().toISOString(),
+      });
     } catch (error) {
       this.logger.error({
         message: "Error processing pending servers",
         batchId,
         error: error.message,
+        timestamp: new Date().toISOString(),
       });
       throw error;
     }

@@ -156,22 +156,64 @@ async function startServer() {
     });
 
     // 발견 작업 상태 확인 엔드포인트
+    // server.js의 status 엔드포인트 수정
     app.get("/yunabuju/discover/status", async (req, res) => {
       try {
-        const lastBatch = await discovery.getLastUnfinishedBatch();
-        if (!lastBatch) {
+        // 현재 진행 중인 배치 정보 조회
+        const query = `
+      SELECT 
+        discovery_batch_id,
+        COUNT(*) as total_servers,
+        COUNT(*) FILTER (WHERE discovery_status = 'pending') as pending_count,
+        COUNT(*) FILTER (WHERE discovery_status = 'in_progress') as in_progress_count,
+        COUNT(*) FILTER (WHERE discovery_status = 'completed') as completed_count,
+        COUNT(*) FILTER (WHERE discovery_status = 'failed') as failed_count,
+        COUNT(*) FILTER (WHERE discovery_status = 'not_korean') as not_korean_count,
+        MIN(discovery_started_at) as started_at,
+        MAX(discovery_completed_at) as last_completion,
+        STRING_AGG(DISTINCT discovery_status, ', ') as current_statuses
+      FROM yunabuju_servers
+      WHERE discovery_started_at > NOW() - INTERVAL '1 day'
+      GROUP BY discovery_batch_id
+      ORDER BY started_at DESC
+      LIMIT 1
+    `;
+
+        const result = await pool.query(query);
+
+        if (result.rows.length === 0) {
           return res.json({
-            status: "no_pending_batch",
-            message: "No unfinished discovery batch found",
+            status: "no_active_batch",
+            message: "No active discovery batch found in the last 24 hours",
           });
         }
 
+        const batchInfo = result.rows[0];
+        const elapsedTime = new Date() - new Date(batchInfo.started_at);
+        const elapsedMinutes = Math.floor(elapsedTime / 60000);
+
         res.json({
-          status: "pending",
-          batchId: lastBatch.discovery_batch_id,
-          totalServers: lastBatch.total_servers,
-          pendingServers: lastBatch.pending_servers,
-          startedAt: lastBatch.started_at,
+          status: "active",
+          batchId: batchInfo.discovery_batch_id,
+          startedAt: batchInfo.started_at,
+          elapsedMinutes,
+          progress: {
+            total: parseInt(batchInfo.total_servers),
+            pending: parseInt(batchInfo.pending_count),
+            inProgress: parseInt(batchInfo.in_progress_count),
+            completed: parseInt(batchInfo.completed_count),
+            failed: parseInt(batchInfo.failed_count),
+            notKorean: parseInt(batchInfo.not_korean_count),
+          },
+          completionPercentage: Math.floor(
+            ((parseInt(batchInfo.completed_count) +
+              parseInt(batchInfo.failed_count) +
+              parseInt(batchInfo.not_korean_count)) /
+              parseInt(batchInfo.total_servers)) *
+              100
+          ),
+          currentStatuses: batchInfo.current_statuses,
+          lastCompletion: batchInfo.last_completion,
         });
       } catch (error) {
         logger.error("Error checking discovery status:", error);
