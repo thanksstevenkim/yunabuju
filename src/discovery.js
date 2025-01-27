@@ -67,6 +67,7 @@ export class KoreanActivityPubDiscovery {
   }
 
   async processPendingServers(batchId) {
+    const BATCH_SIZE = 50;
     const query = `
       SELECT domain 
       FROM yunabuju_servers 
@@ -83,31 +84,77 @@ export class KoreanActivityPubDiscovery {
         serverCount: rows.length,
       });
 
-      for (const row of rows) {
-        try {
-          // 상태를 in_progress로 변경
-          await this.updateServerStatus(row.domain, batchId, "in_progress");
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        const batch = rows.slice(i, i + BATCH_SIZE);
 
-          const isKorean = await this.isKoreanInstance(row.domain);
-          if (isKorean) {
-            await this.updateServerInDb({
-              domain: row.domain,
-              isActive: true,
-              koreanUsageRate: this.koreanUsageRate,
-            });
-            await this.updateServerStatus(row.domain, batchId, "completed");
-            this.logger.info(`Added new Korean server: ${row.domain}`);
-          } else {
-            await this.updateServerStatus(row.domain, batchId, "not_korean");
-          }
+        await Promise.all(
+          batch.map(async (row) => {
+            try {
+              await this.updateServerStatus(row.domain, batchId, "in_progress");
 
-          // 서버당 1초 간격 유지
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        } catch (error) {
-          await this.updateServerStatus(row.domain, batchId, "failed");
-          this.logger.error(`Error processing server ${row.domain}:`, error);
-          continue;
-        }
+              const isKorean = await this.isKoreanInstance(row.domain);
+              if (!isKorean) {
+                await this.updateServerInDb({
+                  domain: row.domain,
+                  isActive: true,
+                  isKoreanServer: false,
+                  koreanUsageRate: this.koreanUsageRate,
+                  lastChecked: new Date(),
+                  discovery_status: "not_korean",
+                });
+                return;
+              }
+
+              const nodeInfo = await this.fetchNodeInfo(row.domain);
+              const instanceInfo = await this.fetchInstanceInfo(row.domain);
+              const { isPersonal, instanceType } =
+                await this.identifyInstanceType(
+                  row.domain,
+                  instanceInfo,
+                  nodeInfo
+                );
+
+              await this.updateServerInDb({
+                domain: row.domain,
+                isActive: true,
+                isKoreanServer: true,
+                koreanUsageRate: this.koreanUsageRate,
+                ...this.extractServerInfo(instanceInfo),
+                hasNodeInfo: !!nodeInfo,
+                isPersonalInstance: isPersonal,
+                instanceType,
+                discovery_status: "completed",
+              });
+
+              this.logger.info({
+                message: "Korean server processed",
+                domain: row.domain,
+                koreanUsageRate: this.koreanUsageRate,
+                instanceType,
+              });
+            } catch (error) {
+              this.logger.error({
+                message: "Error processing server",
+                domain: row.domain,
+                error: error.message,
+              });
+              await this.updateServerInDb({
+                domain: row.domain,
+                isActive: false,
+                discovery_status: "failed",
+              });
+            }
+          })
+        );
+
+        this.logger.info({
+          message: "Batch progress",
+          processedCount: Math.min(i + BATCH_SIZE, rows.length),
+          totalCount: rows.length,
+          remainingCount: Math.max(rows.length - (i + BATCH_SIZE), 0),
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
     } catch (error) {
       this.logger.error({
@@ -120,24 +167,46 @@ export class KoreanActivityPubDiscovery {
   }
 
   async updateServerStatus(domain, batchId, status) {
+    const validStatuses = [
+      "pending",
+      "in_progress",
+      "completed",
+      "failed",
+      "not_korean",
+    ];
+    if (!validStatuses.includes(status)) {
+      throw new Error(`Invalid status: ${status}`);
+    }
+
     const query = `
       UPDATE yunabuju_servers 
       SET 
-        discovery_status = $3::varchar,
+        discovery_status = $3,
         discovery_completed_at = CASE 
-          WHEN $3::varchar IN ('completed', 'failed', 'not_korean') THEN CURRENT_TIMESTAMP 
+          WHEN $3 IN ('completed', 'failed', 'not_korean') THEN CURRENT_TIMESTAMP 
           ELSE discovery_completed_at 
-        END
+        END,
+        last_checked = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
       WHERE domain = $1 AND discovery_batch_id = $2
+      RETURNING discovery_status
     `;
 
     try {
-      await this.pool.query(query, [domain, batchId, String(status)]);
+      const result = await this.pool.query(query, [domain, batchId, status]);
+
+      if (result.rows.length === 0) {
+        throw new Error(
+          `No server found with domain ${domain} and batchId ${batchId}`
+        );
+      }
+
       this.logger.debug({
-        message: "Updated server status",
+        message: "Server status updated",
         domain,
         batchId,
         status,
+        previousStatus: result.rows[0].discovery_status,
       });
     } catch (error) {
       this.logger.error({
@@ -148,6 +217,20 @@ export class KoreanActivityPubDiscovery {
         error: error.message,
       });
       throw error;
+    }
+  }
+
+  async processWithTimeout(domain, fn, timeout) {
+    let timeoutId;
+    try {
+      return await Promise.race([
+        fn(),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("Timeout")), timeout);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -384,10 +467,14 @@ export class KoreanActivityPubDiscovery {
 
   async fetchWithBackoff(url, options = {}, attempts = 3) {
     const parsedUrl = new URL(url);
+    const TIMEOUT = 10000; // 10초 타임아웃
+    const MAX_RETRIES = 2;
+
     for (let i = 0; i < attempts; i++) {
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10000);
+        const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
+
         const response = await fetch(url, {
           ...options,
           signal: controller.signal,
@@ -406,34 +493,38 @@ export class KoreanActivityPubDiscovery {
           }),
         });
 
-        clearTimeout(timeout);
+        clearTimeout(timeoutId);
+
         if (!response.ok) {
           if (response.status >= 500) {
             await this.updateServerFailure(parsedUrl.hostname);
+            throw new Error(`Server error! status: ${response.status}`);
           }
           throw new Error(`HTTP error! status: ${response.status}`);
         }
 
-        // JSON 응답 검증
-        const text = await response.text();
-        try {
-          if (text.includes("<!DOCTYPE")) {
-            throw new Error("Invalid response: HTML received instead of JSON");
-          }
-          const json = JSON.parse(text);
-          return json;
-        } catch (e) {
-          throw new Error(`Invalid JSON response: ${e.message}`);
-        }
+        await this.resetServerFailure(parsedUrl.hostname);
+        return response;
       } catch (error) {
         if (error.code === "ENOTFOUND" || error.code === "EAI_AGAIN") {
           await this.updateServerFailure(parsedUrl.hostname);
-          return null;
+          throw new Error(`DNS lookup failed for ${parsedUrl.hostname}`);
         }
+
+        if (error.name === "AbortError") {
+          if (i === MAX_RETRIES - 1) {
+            await this.updateServerFailure(parsedUrl.hostname);
+            throw new Error(
+              `Timeout after ${MAX_RETRIES} attempts for ${parsedUrl.hostname}`
+            );
+          }
+          continue;
+        }
+
         if (i === attempts - 1) throw error;
-        await new Promise((resolve) =>
-          setTimeout(resolve, 1000 * Math.pow(2, i))
-        );
+
+        const delay = Math.min(1000 * Math.pow(2, i), 5000); // 최대 5초 대기
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }
@@ -585,97 +676,92 @@ export class KoreanActivityPubDiscovery {
   }
 
   async fetchInstanceInfo(domain) {
-    // NodeInfo를 기본 정보 소스로 사용
     try {
-      const nodeInfo = await this.fetchNodeInfo(domain);
-      if (nodeInfo) {
-        // 기본 정보 구성
-        const instanceInfo = this.convertNodeInfoToInstanceInfo(nodeInfo);
+      // 모든 서버 유형의 기본 엔드포인트 먼저 시도
+      const commonEndpoints = [
+        { path: "/api/v1/instance", method: "GET" },
+        { path: "/api/instance", method: "GET" },
+      ];
 
-        // 서버별 추가 정보 가져오기 시도
+      // 기본 엔드포인트로 시도
+      for (const endpoint of commonEndpoints) {
         try {
-          const softwareName = nodeInfo.software?.name?.toLowerCase();
-          let extraInfo = {};
-
-          if (softwareName === "misskey") {
-            // Misskey 추가 정보
-            const response = await this.fetchWithBackoff(
-              `https://${domain}/api/meta`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({}),
-              }
-            );
-            const misskeyData = await response.json();
-            extraInfo = {
-              description: misskeyData.description || instanceInfo.description,
-              registrations: {
-                enabled: misskeyData.disableRegistration !== true,
-              },
-              rules: Array.isArray(misskeyData.policies)
-                ? misskeyData.policies.map((p) => ({ text: p }))
-                : [],
-            };
-          } else if (
-            softwareName === "mastodon" ||
-            softwareName === "pleroma"
-          ) {
-            // Mastodon과 Pleroma의 엔드포인트 시도
-            const endpoints =
-              softwareName === "pleroma"
-                ? ["/api/instance", "/api/v1/instance", "/api/v2/instance"] // Pleroma는 /api/instance를 우선
-                : ["/api/v1/instance", "/api/v2/instance", "/api/instance"]; // Mastodon은 v1을 우선
-
-            let data = null;
-            for (const endpoint of endpoints) {
-              try {
-                const response = await this.fetchWithBackoff(
-                  `https://${domain}${endpoint}`
-                );
-                data = await response.json();
-                break; // 성공하면 반복 중단
-              } catch (error) {
-                this.logger.debug(
-                  `Failed to fetch ${endpoint} for ${domain}: ${error.message}`
-                );
-                continue;
-              }
-            }
-
-            if (!data) {
-              throw new Error("All instance API endpoints failed");
-            }
-
-            extraInfo = {
-              description: data.description || instanceInfo.description,
-              rules: data.rules || [],
-              registrations: {
-                enabled: data.registrations?.enabled ?? !data.closed,
-              },
-            };
-          }
-
-          // 기본 정보와 추가 정보 병합
-          return {
-            ...instanceInfo,
-            ...extraInfo,
-          };
-        } catch (error) {
-          // 추가 정보 가져오기 실패시 기본 NodeInfo 데이터만 사용
-          this.logger.debug(
-            `Failed to fetch additional info for ${domain}: ${error.message}`
+          const response = await this.fetchWithBackoff(
+            `https://${domain}${endpoint.path}`,
+            { method: endpoint.method }
           );
-          return instanceInfo;
+          if (!response) continue;
+          const data = await response.json();
+          if (data) return this.processInstanceData(data);
+        } catch (error) {
+          if (error.message.includes("422")) continue;
         }
       }
-    } catch (error) {
-      this.logger.debug(
-        `NodeInfo fetch failed for ${domain}: ${error.message}`
-      );
-    }
 
-    throw new Error(`Failed to fetch instance info from any endpoint`);
+      // Misskey 엔드포인트 시도
+      try {
+        const response = await this.fetchWithBackoff(
+          `https://${domain}/api/meta`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          }
+        );
+        if (response) {
+          const data = await response.json();
+          if (data) return this.processInstanceData(data, "misskey");
+        }
+      } catch (error) {
+        if (error.message.includes("422")) {
+          const nodeInfo = await this.fetchNodeInfo(domain);
+          if (nodeInfo) return this.processNodeInfo(nodeInfo);
+        }
+      }
+
+      throw new Error("서버 정보 조회 실패");
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  processInstanceData(data, type = "mastodon") {
+    return {
+      software: {
+        name: type,
+        version: data.version,
+      },
+      languages: data.languages || [],
+      stats: {
+        user_count: data.stats?.users || data.stats?.user_count || 0,
+      },
+      description: data.description || "",
+      rules: data.rules || [],
+      registrations: {
+        enabled:
+          type === "misskey"
+            ? !data.disableRegistration
+            : data.registrations?.enabled ?? !data.closed,
+      },
+    };
+  }
+
+  processNodeInfo(nodeInfo) {
+    return {
+      software: {
+        name: nodeInfo.software?.name?.toLowerCase() || "unknown",
+        version: nodeInfo.software?.version,
+      },
+      languages: nodeInfo.metadata?.languages || [],
+      stats: {
+        user_count: nodeInfo.usage?.users?.total || 0,
+      },
+      description: nodeInfo.metadata?.nodeName || "",
+      rules: [],
+      registrations: {
+        enabled: nodeInfo.openRegistrations !== false,
+      },
+    };
   }
 
   convertNodeInfoToInstanceInfo(nodeInfo) {
@@ -799,78 +885,59 @@ export class KoreanActivityPubDiscovery {
     return matches ? matches[1] : null;
   }
 
-  async discoverNewServers(
-    depth = 2,
-    currentDepth = 0,
-    processedServers = new Set(),
-    newServers = new Set(),
-    lastProcessedIndex = 0
-  ) {
-    try {
-      let currentDepthServers =
-        currentDepth === 0 ? new Set(this.seedServers) : new Set();
+  async discoverNewServers(depth = 2) {
+    const processedServers = new Set();
+    const newServers = new Set();
+    const koreanServers = new Set();
 
-      this.logger.info({
-        message: "Starting/Resuming server discovery",
-        currentDepth,
-        processedCount: processedServers.size,
-        newServersCount: newServers.size,
-        lastProcessedIndex,
-      });
+    // 시드 서버로 시작
+    let currentDepthServers = new Set(this.seedServers);
 
-      for (let d = currentDepth; d < depth; d++) {
-        const currentServers = Array.from(currentDepthServers);
-        if (currentServers.length === 0) break;
+    for (let d = 0; d < depth; d++) {
+      const currentServers = Array.from(currentDepthServers);
+      currentDepthServers.clear();
 
-        const unprocessedServers = currentServers.filter(
-          (server) => !processedServers.has(server)
-        );
+      for (const server of currentServers) {
+        if (processedServers.has(server)) continue;
+        processedServers.add(server);
 
-        if (unprocessedServers.length > 0) {
-          const { peers, lastProcessedIndex: newIndex } = await this.fetchPeers(
-            unprocessedServers,
-            lastProcessedIndex
-          );
+        try {
+          // 서버의 피어 가져오기
+          const { peers } = await this.fetchPeers(server);
 
-          for (const peer of peers) {
-            if (!processedServers.has(peer)) {
-              if (!(await this.getServerFromDb(peer))) {
-                newServers.add(peer);
+          // depth 1에서는 모든 피어를 검사
+          if (d === 0) {
+            for (const peer of peers) {
+              if (!processedServers.has(peer)) {
+                if (await this.isKoreanInstance(peer)) {
+                  koreanServers.add(peer);
+                  newServers.add(peer);
+                  currentDepthServers.add(peer); // 다음 depth에서 이 서버의 피어들을 검사
+                }
               }
-              currentDepthServers.add(peer);
             }
           }
-
-          // 현재 상태 저장
-          await this.saveDiscoveryState({
-            currentDepth: d,
-            processedServers: Array.from(processedServers),
-            newServers: Array.from(newServers),
-            lastProcessedIndex: newIndex,
-          });
+          // depth 2 이상에서는 한국어 서버의 피어들만 검사
+          else {
+            if (koreanServers.has(server)) {
+              for (const peer of peers) {
+                if (!processedServers.has(peer)) {
+                  if (await this.isKoreanInstance(peer)) {
+                    koreanServers.add(peer);
+                    newServers.add(peer);
+                  }
+                }
+              }
+            }
+          }
+        } catch (error) {
+          this.logger.error(`Error processing server ${server}:`, error);
+          continue;
         }
-
-        unprocessedServers.forEach((server) => processedServers.add(server));
-
-        this.logger.info({
-          message: `Completed depth ${d + 1}`,
-          newServersFound: newServers.size,
-          totalProcessed: processedServers.size,
-        });
       }
-
-      return Array.from(newServers);
-    } catch (error) {
-      // 현재 상태 저장
-      await this.saveDiscoveryState({
-        currentDepth,
-        processedServers: Array.from(processedServers),
-        newServers: Array.from(newServers),
-        lastProcessedIndex,
-      });
-
-      throw error;
     }
+
+    return Array.from(newServers);
   }
 
   async saveDiscoveryState(state) {
@@ -1054,8 +1121,8 @@ export class KoreanActivityPubDiscovery {
         (domain, is_active, korean_usage_rate, software_name, software_version,
         registration_open, registration_approval_required, total_users,
         description, has_nodeinfo, is_korean_server, is_personal_instance,
-        instance_type, last_checked)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
+        instance_type, last_checked, discovery_status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, $14)
       ON CONFLICT (domain) 
       DO UPDATE SET 
         is_active = $2,
@@ -1071,6 +1138,7 @@ export class KoreanActivityPubDiscovery {
         is_personal_instance = $12,
         instance_type = $13,
         last_checked = CURRENT_TIMESTAMP,
+        discovery_status = COALESCE($14, yunabuju_servers.discovery_status),
         updated_at = CURRENT_TIMESTAMP
     `;
 
@@ -1088,6 +1156,7 @@ export class KoreanActivityPubDiscovery {
       server.isKoreanServer,
       server.isPersonalInstance,
       server.instanceType,
+      server.discovery_status,
     ]);
   }
 
@@ -1117,77 +1186,17 @@ export class KoreanActivityPubDiscovery {
   async startDiscovery(batchId = null) {
     batchId =
       batchId || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const batchSize = 50;
-    this.concurrentRequests = 20; // Increased from 5
 
     try {
-      const servers = await this.discoverNewServers(2); // Reduced depth
-      const batches = [];
-
-      for (let i = 0; i < servers.length; i += batchSize) {
-        batches.push(servers.slice(i, i + batchSize));
+      // 새 배치인 경우만 서버 발견
+      if (batchId.includes("-")) {
+        const servers = await this.discoverNewServers(2);
+        await this.insertNewServers(batchId, servers);
       }
 
-      for (const batch of batches) {
-        const processingPromises = batch.map(async (domain) => {
-          try {
-            // Skip if already checked and confirmed non-Korean
-            const existingServer = await this.getServerFromDb(domain);
-            if (existingServer && existingServer.is_korean_server === false) {
-              return;
-            }
-
-            // Quick Korean check before detailed processing
-            const isKorean = await this.isKoreanInstance(domain);
-            if (!isKorean) {
-              await this.updateServerInDb({
-                domain,
-                isActive: true,
-                isKoreanServer: false,
-                koreanUsageRate: this.koreanUsageRate,
-                lastChecked: new Date(),
-              });
-              return;
-            }
-
-            // Proceed with detailed server info gathering for Korean servers
-            const nodeInfo = await this.fetchNodeInfo(domain);
-            const instanceInfo = await this.fetchInstanceInfo(domain);
-            const { isPersonal, instanceType } =
-              await this.identifyInstanceType(domain, instanceInfo, nodeInfo);
-
-            await this.updateServerInDb({
-              domain,
-              isActive: true,
-              isKoreanServer: true,
-              koreanUsageRate: this.koreanUsageRate,
-              ...this.extractServerInfo(instanceInfo),
-              hasNodeInfo: !!nodeInfo,
-              isPersonalInstance: isPersonal,
-              instanceType,
-            });
-
-            this.logger.info({
-              message: "Korean server processed",
-              domain,
-              koreanUsageRate: this.koreanUsageRate,
-              instanceType,
-            });
-          } catch (error) {
-            this.logger.error({
-              message: "Error processing server",
-              domain,
-              error: error.message,
-            });
-            await this.updateServerFailure(domain);
-          }
-        });
-
-        await Promise.all(processingPromises);
-      }
-
+      // pending 서버 처리
+      await this.processPendingServers(batchId);
       await this.updateBatchStatus(batchId, "completed");
-
       return batchId;
     } catch (error) {
       this.logger.error({
@@ -1290,34 +1299,66 @@ export class KoreanActivityPubDiscovery {
 
   async isKoreanInstance(domain) {
     try {
-      const nodeInfo = await this.fetchNodeInfo(domain);
-      if (!nodeInfo) {
-        this.logger.info(`No NodeInfo available for ${domain}`);
+      this.logger.info(`[${domain}] 한국어 서버 체크 시작`);
+
+      // 더 짧은 타임아웃으로 NodeInfo 체크
+      const nodeInfo = await Promise.race([
+        this.fetchNodeInfo(domain),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Timeout")), 5000)
+        ),
+      ]).catch(() => null);
+
+      if (nodeInfo?.metadata?.languages?.includes("ko")) {
+        this.logger.info(`[${domain}] NodeInfo에서 한국어 지원 확인됨`);
+        this.koreanUsageRate = 1.0;
+        return true;
+      }
+
+      // 더 짧은 타임아웃으로 인스턴스 정보 체크
+      const instanceInfo = await Promise.race([
+        this.fetchInstanceInfo(domain),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Timeout")), 5000)
+        ),
+      ]).catch(() => null);
+
+      if (!instanceInfo) {
+        this.logger.info(`[${domain}] 인스턴스 정보를 가져올 수 없음`);
         return false;
       }
 
-      const isKoreanServer = await this.checkKoreanSupport(domain, nodeInfo);
-      if (!isKoreanServer) {
-        this.logger.info(`${domain} is not a Korean server`);
-        return false;
+      if (instanceInfo.languages?.includes("ko")) {
+        this.logger.info(`[${domain}] 인스턴스 정보에서 한국어 지원 확인됨`);
+        this.koreanUsageRate = 0.9;
+        return true;
       }
 
-      const koreanUsageRate = await this.analyzeKoreanUsage(domain);
-      this.koreanUsageRate = koreanUsageRate; // 값을 저장
-      const isKorean = koreanUsageRate > 0.3;
+      const descriptions = [
+        instanceInfo.description,
+        instanceInfo.extended_description,
+        instanceInfo.branding_server_description,
+      ].filter(Boolean);
 
-      this.logger.info({
-        message: `Korean usage analysis for ${domain}`,
-        koreanUsageRate,
-        isKorean,
-      });
+      for (const desc of descriptions) {
+        if (this.containsKorean(desc)) {
+          this.logger.info(`[${domain}] 서버 설명에서 한국어 확인됨`);
+          this.koreanUsageRate = 0.9;
+          return true;
+        }
+      }
 
-      return isKorean;
+      if (instanceInfo.rules?.some((rule) => this.containsKorean(rule.text))) {
+        this.logger.info(`[${domain}] 서버 규칙에서 한국어 확인됨`);
+        this.koreanUsageRate = 0.9;
+        return true;
+      }
+
+      this.logger.info(`[${domain}] 한국어 사용 흔적을 찾을 수 없음`);
+      this.koreanUsageRate = 0;
+      return false;
     } catch (error) {
-      this.logger.error({
-        message: `Error checking Korean instance ${domain}`,
-        error: error.message,
-      });
+      this.logger.error(`[${domain}] 오류 발생:`, error);
       return false;
     }
   }
