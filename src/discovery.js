@@ -538,6 +538,7 @@ export class KoreanActivityPubDiscovery {
     const parsedUrl = new URL(url);
     const TIMEOUT = 2000;
     const MAX_RETRIES = 2;
+    const MAX_RESPONSE_SIZE = 1024 * 1024; // 1MB 제한
 
     for (let i = 0; i < attempts; i++) {
       try {
@@ -552,6 +553,74 @@ export class KoreanActivityPubDiscovery {
         if (options.method === "POST" && options.body) {
           headers["Content-Type"] =
             headers["Content-Type"] || "application/json";
+        }
+
+        // HEAD 요청으로 사이즈 확인
+        try {
+          const headResponse = await fetch(url, {
+            method: "HEAD",
+            headers,
+            signal: controller.signal,
+            agent: new https.Agent({
+              rejectUnauthorized: false,
+              servername: parsedUrl.hostname,
+              keepAlive: true,
+              timeout: 5000,
+            }),
+          });
+
+          const contentLength = parseInt(
+            headResponse.headers.get("content-length")
+          );
+          const contentType = headResponse.headers.get("content-type");
+
+          // 응답 크기와 타입 DB에 기록
+          await this.pool.query(
+            `
+            UPDATE yunabuju_servers 
+            SET 
+              last_response_size = $2,
+              last_content_type = $3,
+              updated_at = CURRENT_TIMESTAMP
+            WHERE domain = $1
+          `,
+            [parsedUrl.hostname, contentLength, contentType]
+          );
+
+          // 응답 크기가 너무 크거나 허용되지 않은 content-type인 경우
+          if (contentLength && contentLength > MAX_RESPONSE_SIZE) {
+            await this.markServerAsSuspicious(
+              parsedUrl.hostname,
+              "large_response",
+              contentLength
+            );
+            throw new Error(`Response too large: ${contentLength} bytes`);
+          }
+
+          const allowedTypes = [
+            "application/json",
+            "application/activity+json",
+            "application/ld+json",
+            "text/html",
+            "text/plain",
+          ];
+
+          if (
+            contentType &&
+            !allowedTypes.some((type) => contentType.includes(type))
+          ) {
+            await this.markServerAsSuspicious(
+              parsedUrl.hostname,
+              "invalid_content_type",
+              contentType
+            );
+            throw new Error(`Invalid content type: ${contentType}`);
+          }
+        } catch (headError) {
+          // HEAD 요청 실패 시 로깅만 하고 계속 진행
+          this.logger.debug(
+            `HEAD request failed for ${parsedUrl.hostname}: ${headError.message}`
+          );
         }
 
         const response = await fetch(url, {
@@ -571,14 +640,13 @@ export class KoreanActivityPubDiscovery {
 
         clearTimeout(timeoutId);
 
-        // 4xx 클라이언트 에러는 조용히 처리
+        // 4xx는 조용히 처리
         if (response.status >= 400 && response.status < 500) {
           this.logger.debug({
             message: `Skipping ${response.status} error`,
             url: parsedUrl.hostname,
             endpoint: url,
             status: response.status,
-            statusText: response.statusText,
           });
           return null;
         }
@@ -617,6 +685,40 @@ export class KoreanActivityPubDiscovery {
     }
 
     return null;
+  }
+
+  async markServerAsSuspicious(domain, reason, details) {
+    const query = `
+      UPDATE yunabuju_servers 
+      SET 
+        is_active = false,
+        failed_attempts = COALESCE(failed_attempts, 0) + 1,
+        last_failed_at = CURRENT_TIMESTAMP,
+        suspicious_reason = $2,
+        suspicious_details = $3,
+        blocked_until = CURRENT_TIMESTAMP + INTERVAL '7 days',
+        next_check_at = CURRENT_TIMESTAMP + INTERVAL '7 days',
+        discovery_status = 'blocked',
+        updated_at = CURRENT_TIMESTAMP
+      WHERE domain = $1
+    `;
+
+    try {
+      await this.pool.query(query, [domain, reason, details]);
+      this.logger.warn({
+        message: "Server marked as suspicious",
+        domain,
+        reason,
+        details,
+      });
+    } catch (error) {
+      this.logger.error({
+        message: "Error marking server as suspicious",
+        domain,
+        reason,
+        error: error.message,
+      });
+    }
   }
 
   async updateServerFailure(domain) {

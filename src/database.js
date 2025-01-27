@@ -32,7 +32,12 @@ const createTableSQL = `
     discovery_batch_id VARCHAR(50),
     discovery_status VARCHAR(20) DEFAULT 'pending',
     discovery_started_at TIMESTAMP,
-    discovery_completed_at TIMESTAMP
+    discovery_completed_at TIMESTAMP,
+    suspicious_reason VARCHAR(50),
+    suspicious_details TEXT,
+    blocked_until TIMESTAMP,
+    last_response_size BIGINT,
+    last_content_type VARCHAR(100)
   );
 `;
 
@@ -80,6 +85,41 @@ async function setupDatabase() {
         BEGIN
           ALTER TABLE yunabuju_discovery_state 
             ADD COLUMN current_server VARCHAR(255);
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE yunabuju_servers
+            ADD COLUMN suspicious_reason VARCHAR(50);
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE yunabuju_servers
+            ADD COLUMN suspicious_details TEXT;
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE yunabuju_servers
+            ADD COLUMN blocked_until TIMESTAMP;
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE yunabuju_servers
+            ADD COLUMN last_response_size BIGINT;
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE yunabuju_servers
+            ADD COLUMN last_content_type VARCHAR(100);
         EXCEPTION
           WHEN duplicate_column THEN NULL;
         END;
