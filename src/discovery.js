@@ -68,9 +68,9 @@ export class KoreanActivityPubDiscovery {
 
   // discovery.js의 processPendingServers 메서드 수정
   async processPendingServers(batchId) {
-    const BATCH_SIZE = 50; // 한 번에 처리할 서버 수
-    const CONCURRENT_CHECKS = 10; // 동시에 처리할 서버 수
-    const CHECK_INTERVAL = 100; // 배치 간 대기 시간 (ms)
+    const BATCH_SIZE = 100; // 한 번에 처리할 서버 수
+    const CONCURRENT_CHECKS = 20; // 동시에 처리할 서버 수
+    const CHECK_INTERVAL = 50; // 배치 간 대기 시간 (ms)
     try {
       // 전체 pending 서버 수 확인
       const totalQuery = `
@@ -536,7 +536,7 @@ export class KoreanActivityPubDiscovery {
 
   async fetchWithBackoff(url, options = {}, attempts = 3) {
     const parsedUrl = new URL(url);
-    const TIMEOUT = 10000;
+    const TIMEOUT = 2000;
     const MAX_RETRIES = 2;
 
     for (let i = 0; i < attempts; i++) {
@@ -544,7 +544,6 @@ export class KoreanActivityPubDiscovery {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
 
-        // POST 요청의 body 처리를 위한 headers 보완
         const headers = {
           "User-Agent": "Yunabuju-ActivityPub-Directory/1.0",
           ...options.headers,
@@ -571,6 +570,18 @@ export class KoreanActivityPubDiscovery {
         });
 
         clearTimeout(timeoutId);
+
+        // 4xx 클라이언트 에러는 조용히 처리
+        if (response.status >= 400 && response.status < 500) {
+          this.logger.debug({
+            message: `Skipping ${response.status} error`,
+            url: parsedUrl.hostname,
+            endpoint: url,
+            status: response.status,
+            statusText: response.statusText,
+          });
+          return null;
+        }
 
         if (!response.ok) {
           if (response.status >= 500) {
@@ -604,6 +615,8 @@ export class KoreanActivityPubDiscovery {
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
+
+    return null;
   }
 
   async updateServerFailure(domain) {
@@ -859,97 +872,82 @@ export class KoreanActivityPubDiscovery {
     };
   }
 
-  async analyzeKoreanUsage(domain) {
-    try {
-      const nodeInfo = await this.fetchNodeInfo(domain);
-      const softwareName = nodeInfo?.software?.name?.toLowerCase();
-      const endpoint =
-        softwareName === "misskey"
-          ? {
-              url: `https://${domain}/api/notes/local-timeline`,
-              method: "POST",
-              body: { limit: 50, withFiles: false },
-            }
-          : {
-              url: `https://${domain}/api/v1/timelines/public?local=true&limit=50`,
-              method: "GET",
-            };
-
-      const response = await this.fetchWithBackoff(endpoint.url, {
-        method: endpoint.method,
-        headers: { "Content-Type": "application/json" },
-        ...(endpoint.body ? { body: JSON.stringify(endpoint.body) } : {}),
-      });
-
-      const posts = await response.json();
-      if (!Array.isArray(posts) || posts.length === 0) {
-        return await this.analyzeServerMetadata(domain);
-      }
-
-      const validPosts = posts.filter((post) => {
-        const content = softwareName === "misskey" ? post.text : post.content;
-        return typeof content === "string" && content.length > 0;
-      });
-
-      if (validPosts.length === 0) {
-        return await this.analyzeServerMetadata(domain);
-      }
-
-      const koreanPosts = validPosts.filter((post) => {
-        const content =
-          softwareName === "misskey" ? post.text : this.stripHtml(post.content);
-        const cleanContent = content.replace(
-          /[\uD800-\uDBFF][\uDC00-\uDFFF]/g,
-          ""
-        );
-        return this.containsKorean(cleanContent);
-      });
-
-      return koreanPosts.length / validPosts.length;
-    } catch (error) {
-      this.logger.warn(`Error in analyzeKoreanUsage for ${domain}:`, error);
-      return await this.analyzeServerMetadata(domain);
-    }
-  }
-
   stripHtml(html) {
     return html.replace(/<[^>]*>/g, "");
   }
 
-  async analyzeServerMetadata(domain) {
+  // 타임라인 데이터 가져오기
+  async fetchTimelineData(domain) {
+    // Misskey 체크를 위한 간단한 엔드포인트 시도
     try {
-      // 인스턴스 정보에서 한국어 사용 여부 확인
-      const instanceInfo = await this.fetchInstanceInfo(domain);
-      if (!instanceInfo) return 0;
-
-      let koreanPoints = 0;
-      let totalPoints = 0;
-
-      // 서버 설명에서 한국어 확인
-      if (instanceInfo.description) {
-        totalPoints++;
-        if (this.containsKorean(instanceInfo.description)) koreanPoints++;
+      const response = await this.fetchWithBackoff(
+        `https://${domain}/api/meta`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        }
+      );
+      if (response) {
+        // Misskey 엔드포인트
+        const timelineResponse = await this.fetchWithBackoff(
+          `https://${domain}/api/notes/local-timeline`,
+          {
+            method: "POST",
+            body: JSON.stringify({ limit: 50, withFiles: false }),
+          }
+        );
+        if (!timelineResponse) return null;
+        const data = await timelineResponse.json();
+        return { data, softwareName: "misskey" };
       }
+    } catch {}
 
-      // 서버 규칙에서 한국어 확인
-      if (Array.isArray(instanceInfo.rules)) {
-        totalPoints += instanceInfo.rules.length;
-        koreanPoints += instanceInfo.rules.filter((rule) =>
-          this.containsKorean(rule.text)
-        ).length;
-      }
+    // 기본 Mastodon/Pleroma 엔드포인트
+    const response = await this.fetchWithBackoff(
+      `https://${domain}/api/v1/timelines/public?local=true&limit=50`
+    );
+    if (!response) return null;
 
-      // 언어 설정 확인
-      if (Array.isArray(instanceInfo.languages)) {
-        totalPoints++;
-        if (instanceInfo.languages.includes("ko")) koreanPoints++;
-      }
-
-      return totalPoints > 0 ? koreanPoints / totalPoints : 0;
-    } catch (error) {
-      this.logger.error(`Error in analyzeServerMetadata for ${domain}:`, error);
-      return 0;
+    try {
+      const data = await response.json();
+      return { data, softwareName: "mastodon" };
+    } catch {
+      return null;
     }
+  }
+
+  async withTimeout(promise, ms = 2000) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Timeout")), ms)
+      ),
+    ]).catch(() => null);
+  }
+
+  analyzeTimelineContent(timelineData) {
+    if (!timelineData || !Array.isArray(timelineData.data)) return 0;
+
+    const { data, softwareName } = timelineData;
+    const validPosts = data.filter((post) => {
+      const content = softwareName === "misskey" ? post.text : post.content;
+      return typeof content === "string" && content.length > 0;
+    });
+
+    if (validPosts.length === 0) return 0;
+
+    const koreanPosts = validPosts.filter((post) => {
+      const content =
+        softwareName === "misskey" ? post.text : this.stripHtml(post.content);
+      const cleanContent = content.replace(
+        /[\uD800-\uDBFF][\uDC00-\uDFFF]/g,
+        ""
+      );
+      return this.containsKorean(cleanContent);
+    });
+
+    return koreanPosts.length / validPosts.length;
   }
 
   extractNextLink(linkHeader) {
@@ -1354,8 +1352,8 @@ export class KoreanActivityPubDiscovery {
         korean_usage_rate = $3,
         last_korean_check = CURRENT_TIMESTAMP,
         next_korean_check = CASE
-          WHEN $2 = false THEN NULL  -- 한국어 서버가 아닌 것으로 확인되면 영구적으로 캐시
-          ELSE NULL  -- 한국어 서버인 경우도 매번 체크할 필요 없음
+          WHEN $2 = false THEN null  -- 한국어 서버가 아닌 것으로 확인되면 영구적으로 캐시
+          ELSE CURRENT_TIMESTAMP + INTERVAL '1 day'  -- 한국어 서버인 경우 하루 후에 다시 체크
         END,
         updated_at = CURRENT_TIMESTAMP
       WHERE domain = $1
@@ -1384,7 +1382,7 @@ export class KoreanActivityPubDiscovery {
         timestamp: new Date().toISOString(),
       });
 
-      // 캐시된 결과가 있는지 확인
+      // 1. 캐시 체크
       const cachedResult = await this.pool.query(
         "SELECT is_korean_server, korean_usage_rate FROM yunabuju_servers WHERE domain = $1 AND last_korean_check > NOW() - INTERVAL '1 day'",
         [domain]
@@ -1393,164 +1391,106 @@ export class KoreanActivityPubDiscovery {
       if (cachedResult.rows.length > 0) {
         const { is_korean_server, korean_usage_rate } = cachedResult.rows[0];
         this.koreanUsageRate = korean_usage_rate;
-
-        this.logger.info({
-          message: "Using cached Korean check result",
-          domain,
-          isKorean: is_korean_server,
-          koreanUsageRate: korean_usage_rate,
-          source: "cache",
-          processingTime: (performance.now() - startTime).toFixed(2),
-        });
-
         return is_korean_server;
       }
 
-      // NodeInfo 체크 (5초 타임아웃)
-      const nodeInfo = await Promise.race([
-        this.fetchNodeInfo(domain),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("NodeInfo Timeout")), 5000)
-        ),
-      ]).catch((error) => {
+      // 2. 기본 정보 수집 (병렬)
+      let instanceInfo = null;
+      let nodeInfo = null;
+      let timelineData = null;
+
+      try {
+        [nodeInfo, instanceInfo, timelineData] = await Promise.all([
+          // NodeInfo 체크
+          Promise.race([
+            this.fetchNodeInfo(domain),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("NodeInfo Timeout")), 2000)
+            ),
+          ]).catch(() => null),
+
+          // Instance Info 체크
+          Promise.race([
+            this.fetchInstanceInfo(domain),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("Instance Timeout")), 2000)
+            ),
+          ]).catch(() => null),
+
+          // 타임라인 데이터 체크
+          this.fetchTimelineData(domain).catch(() => null),
+        ]);
+      } catch (error) {
         this.logger.debug({
-          message: "NodeInfo check failed",
+          message: "Error fetching server information",
           domain,
           error: error.message,
         });
-        return null;
-      });
-
-      if (nodeInfo?.metadata?.languages?.includes("ko")) {
-        this.koreanUsageRate = 1.0;
-        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
-
-        this.logger.info({
-          message: "Korean support found in NodeInfo",
-          domain,
-          source: "nodeInfo",
-          koreanUsageRate: this.koreanUsageRate,
-          processingTime: (performance.now() - startTime).toFixed(2),
-        });
-
-        return true;
       }
 
-      // 인스턴스 정보 체크 (5초 타임아웃)
-      const instanceInfo = await Promise.race([
-        this.fetchInstanceInfo(domain),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("InstanceInfo Timeout")), 5000)
-        ),
-      ]).catch((error) => {
+      // 3. 응답 데이터가 전혀 없으면 빠르게 실패
+      if (!nodeInfo && !instanceInfo && !timelineData) {
         this.logger.debug({
-          message: "Instance info check failed",
+          message: "No server information available",
           domain,
-          error: error.message,
-        });
-        return null;
-      });
-
-      if (!instanceInfo) {
-        this.logger.info({
-          message: "No instance info available",
-          domain,
-          processingTime: (performance.now() - startTime).toFixed(2),
         });
         await this.updateKoreanServerStatus(domain, false, 0);
         return false;
       }
 
-      // 언어 설정 체크
-      if (instanceInfo.languages?.includes("ko")) {
-        this.koreanUsageRate = 0.9;
+      // 4. NodeInfo 기반 체크
+      if (nodeInfo?.metadata?.languages?.includes("ko")) {
+        this.koreanUsageRate = 1.0;
         await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
-
-        this.logger.info({
-          message: "Korean support found in instance languages",
-          domain,
-          source: "instanceLanguages",
-          koreanUsageRate: this.koreanUsageRate,
-          processingTime: (performance.now() - startTime).toFixed(2),
-        });
-
         return true;
       }
 
-      // 서버 설명 체크
-      const descriptions = [
-        instanceInfo.description,
-        instanceInfo.extended_description,
-        instanceInfo.branding_server_description,
-      ].filter(Boolean);
+      // 5. Instance Info 기반 체크
+      if (instanceInfo?.languages?.includes("ko")) {
+        this.koreanUsageRate = 0.9;
+        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
+        return true;
+      }
 
-      for (const desc of descriptions) {
-        if (this.containsKorean(desc)) {
+      // 6. 텍스트 기반 체크
+      if (instanceInfo) {
+        const textsToCheck = [
+          instanceInfo.description,
+          instanceInfo.extended_description,
+          instanceInfo.branding_server_description,
+          ...(instanceInfo.rules?.map((rule) => rule.text) || []),
+        ].filter(Boolean);
+
+        if (textsToCheck.some((text) => this.containsKorean(text))) {
           this.koreanUsageRate = 0.9;
           await this.updateKoreanServerStatus(
             domain,
             true,
             this.koreanUsageRate
           );
-
-          this.logger.info({
-            message: "Korean text found in server description",
-            domain,
-            source: "description",
-            koreanUsageRate: this.koreanUsageRate,
-            processingTime: (performance.now() - startTime).toFixed(2),
-          });
-
           return true;
         }
       }
 
-      // 서버 규칙 체크
-      if (instanceInfo.rules?.some((rule) => this.containsKorean(rule.text))) {
-        this.koreanUsageRate = 0.9;
-        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
-
-        this.logger.info({
-          message: "Korean text found in server rules",
-          domain,
-          source: "rules",
-          koreanUsageRate: this.koreanUsageRate,
-          processingTime: (performance.now() - startTime).toFixed(2),
-        });
-
-        return true;
+      // 7. 타임라인 분석
+      if (timelineData) {
+        const koreanRate = this.analyzeTimelineContent(timelineData);
+        if (koreanRate > 0.3) {
+          this.koreanUsageRate = koreanRate;
+          await this.updateKoreanServerStatus(
+            domain,
+            true,
+            this.koreanUsageRate
+          );
+          return true;
+        }
       }
 
-      // 타임라인 분석
-      const timelineKoreanRate = await this.analyzeKoreanUsage(domain);
-      if (timelineKoreanRate > 0.3) {
-        this.koreanUsageRate = timelineKoreanRate;
-        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
-
-        this.logger.info({
-          message: "Korean usage found in timeline",
-          domain,
-          source: "timeline",
-          koreanUsageRate: this.koreanUsageRate,
-          processingTime: (performance.now() - startTime).toFixed(2),
-        });
-
-        return true;
-      }
-
-      // 한국어 서버가 아닌 것으로 판단
+      // 8. 한국어 서버가 아닌 것으로 판단
       await this.updateKoreanServerStatus(domain, false, 0);
-
-      this.logger.info({
-        message: "Server determined as non-Korean",
-        domain,
-        processingTime: (performance.now() - startTime).toFixed(2),
-      });
-
       return false;
     } catch (error) {
       const processingTime = performance.now() - startTime;
-
       this.logger.error({
         message: "Error in Korean server check",
         domain,
