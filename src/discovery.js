@@ -68,146 +68,168 @@ export class KoreanActivityPubDiscovery {
 
   // discovery.js의 processPendingServers 메서드 수정
   async processPendingServers(batchId) {
-    const BATCH_SIZE = 50;
-    const query = `
-    SELECT domain 
-    FROM yunabuju_servers 
-    WHERE discovery_batch_id = $1 
-      AND discovery_status = 'pending'
-    ORDER BY domain
-  `;
-
+    const BATCH_SIZE = 50; // 한 번에 처리할 서버 수
+    const CONCURRENT_CHECKS = 10; // 동시에 처리할 서버 수
+    const CHECK_INTERVAL = 100; // 배치 간 대기 시간 (ms)
     try {
-      const { rows } = await this.pool.query(query, [batchId]);
+      // 전체 pending 서버 수 확인
+      const totalQuery = `
+        SELECT COUNT(*) as total 
+        FROM yunabuju_servers 
+        WHERE discovery_batch_id = $1 
+          AND discovery_status = 'pending'
+      `;
+      const {
+        rows: [{ total }],
+      } = await this.pool.query(totalQuery, [batchId]);
+
       this.logger.info({
-        message: "Starting to process pending servers",
+        message: "Starting pending servers processing",
         batchId,
-        serverCount: rows.length,
+        totalPendingServers: total,
+        batchSize: BATCH_SIZE,
+        concurrentChecks: CONCURRENT_CHECKS,
         timestamp: new Date().toISOString(),
       });
 
       let processedCount = 0;
-      let successCount = 0;
-      let failCount = 0;
-      let notKoreanCount = 0;
 
-      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-        const batch = rows.slice(i, i + BATCH_SIZE);
+      while (true) {
+        // BATCH_SIZE만큼의 pending 서버를 가져옴
+        const query = `
+          SELECT domain 
+          FROM yunabuju_servers 
+          WHERE discovery_batch_id = $1 
+            AND discovery_status = 'pending'
+          LIMIT $2
+        `;
+        const { rows: pendingServers } = await this.pool.query(query, [
+          batchId,
+          BATCH_SIZE,
+        ]);
 
-        this.logger.info({
-          message: "Processing batch",
-          batchNumber: Math.floor(i / BATCH_SIZE) + 1,
-          totalBatches: Math.ceil(rows.length / BATCH_SIZE),
-          batchSize: batch.length,
-          timestamp: new Date().toISOString(),
-        });
+        if (pendingServers.length === 0) break;
 
-        await Promise.all(
-          batch.map(async (row) => {
-            try {
-              this.logger.info({
-                message: "Starting server verification",
-                domain: row.domain,
-                status: "in_progress",
-                timestamp: new Date().toISOString(),
-              });
+        // CONCURRENT_CHECKS만큼씩 동시 처리
+        for (let i = 0; i < pendingServers.length; i += CONCURRENT_CHECKS) {
+          const batch = pendingServers.slice(i, i + CONCURRENT_CHECKS);
 
-              await this.updateServerStatus(row.domain, batchId, "in_progress");
+          this.logger.info({
+            message: "Processing batch",
+            batchId,
+            currentBatch: processedCount + i + 1,
+            batchSize: batch.length,
+            totalProcessed: processedCount + i,
+            totalPending: total,
+            percentComplete: (((processedCount + i) / total) * 100).toFixed(2),
+          });
 
-              const isKorean = await this.isKoreanInstance(row.domain);
-              if (!isKorean) {
+          await Promise.all(
+            batch.map(async (row) => {
+              try {
+                // 상태를 in_progress로 업데이트
+                await this.updateServerStatus(
+                  row.domain,
+                  batchId,
+                  "in_progress"
+                );
+
+                this.logger.info({
+                  message: "Processing server",
+                  domain: row.domain,
+                  status: "in_progress",
+                });
+
+                const isKorean = await this.isKoreanInstance(row.domain);
+
+                if (!isKorean) {
+                  await this.updateServerInDb({
+                    domain: row.domain,
+                    isActive: true,
+                    isKoreanServer: false,
+                    koreanUsageRate: this.koreanUsageRate,
+                    lastChecked: new Date(),
+                    discovery_status: "not_korean",
+                  });
+
+                  this.logger.info({
+                    message: "Server processed - Not Korean",
+                    domain: row.domain,
+                    koreanUsageRate: this.koreanUsageRate,
+                  });
+                  return;
+                }
+
+                const nodeInfo = await this.fetchNodeInfo(row.domain);
+                const instanceInfo = await this.fetchInstanceInfo(row.domain);
+                const { isPersonal, instanceType } =
+                  await this.identifyInstanceType(
+                    row.domain,
+                    instanceInfo,
+                    nodeInfo
+                  );
+
                 await this.updateServerInDb({
                   domain: row.domain,
                   isActive: true,
-                  isKoreanServer: false,
+                  isKoreanServer: true,
                   koreanUsageRate: this.koreanUsageRate,
-                  lastChecked: new Date(),
-                  discovery_status: "not_korean",
+                  ...this.extractServerInfo(instanceInfo),
+                  hasNodeInfo: !!nodeInfo,
+                  isPersonalInstance: isPersonal,
+                  instanceType,
+                  discovery_status: "completed",
                 });
-                notKoreanCount++;
+
                 this.logger.info({
-                  message: "Server verified as non-Korean",
+                  message: "Server processed - Korean",
                   domain: row.domain,
-                  timestamp: new Date().toISOString(),
+                  koreanUsageRate: this.koreanUsageRate,
+                  instanceType,
+                  isPersonal,
                 });
-                return;
+              } catch (error) {
+                this.logger.error({
+                  message: "Error processing server",
+                  domain: row.domain,
+                  error: error.message,
+                });
+
+                await this.updateServerInDb({
+                  domain: row.domain,
+                  isActive: false,
+                  discovery_status: "failed",
+                });
               }
+            })
+          );
 
-              const nodeInfo = await this.fetchNodeInfo(row.domain);
-              const instanceInfo = await this.fetchInstanceInfo(row.domain);
-              const { isPersonal, instanceType } =
-                await this.identifyInstanceType(
-                  row.domain,
-                  instanceInfo,
-                  nodeInfo
-                );
+          // 배치 간 약간의 대기 시간
+          await new Promise((resolve) => setTimeout(resolve, CHECK_INTERVAL));
+        }
 
-              await this.updateServerInDb({
-                domain: row.domain,
-                isActive: true,
-                isKoreanServer: true,
-                koreanUsageRate: this.koreanUsageRate,
-                ...this.extractServerInfo(instanceInfo),
-                hasNodeInfo: !!nodeInfo,
-                isPersonalInstance: isPersonal,
-                instanceType,
-                discovery_status: "completed",
-              });
-
-              successCount++;
-              this.logger.info({
-                message: "Server verification completed",
-                domain: row.domain,
-                koreanUsageRate: this.koreanUsageRate,
-                instanceType,
-                timestamp: new Date().toISOString(),
-              });
-            } catch (error) {
-              failCount++;
-              this.logger.error({
-                message: "Server verification failed",
-                domain: row.domain,
-                error: error.message,
-                timestamp: new Date().toISOString(),
-              });
-              await this.updateServerInDb({
-                domain: row.domain,
-                isActive: false,
-                discovery_status: "failed",
-              });
-            }
-            processedCount++;
-          })
-        );
+        processedCount += pendingServers.length;
 
         this.logger.info({
-          message: "Batch progress",
+          message: "Batch complete",
+          batchId,
           processedCount,
-          successCount,
-          failCount,
-          notKoreanCount,
-          remainingCount: rows.length - processedCount,
-          timestamp: new Date().toISOString(),
+          totalPending: total,
+          percentComplete: ((processedCount / total) * 100).toFixed(2),
         });
-
-        await new Promise((resolve) => setTimeout(resolve, 100));
       }
 
       this.logger.info({
-        message: "Server processing completed",
+        message: "All pending servers processed",
         batchId,
         totalProcessed: processedCount,
-        successful: successCount,
-        failed: failCount,
-        notKorean: notKoreanCount,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
       this.logger.error({
-        message: "Error processing pending servers",
+        message: "Error in processPendingServers",
         batchId,
         error: error.message,
-        timestamp: new Date().toISOString(),
       });
       throw error;
     }
@@ -514,7 +536,7 @@ export class KoreanActivityPubDiscovery {
 
   async fetchWithBackoff(url, options = {}, attempts = 3) {
     const parsedUrl = new URL(url);
-    const TIMEOUT = 10000; // 10초 타임아웃
+    const TIMEOUT = 10000;
     const MAX_RETRIES = 2;
 
     for (let i = 0; i < attempts; i++) {
@@ -522,13 +544,21 @@ export class KoreanActivityPubDiscovery {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
 
+        // POST 요청의 body 처리를 위한 headers 보완
+        const headers = {
+          "User-Agent": "Yunabuju-ActivityPub-Directory/1.0",
+          ...options.headers,
+        };
+
+        if (options.method === "POST" && options.body) {
+          headers["Content-Type"] =
+            headers["Content-Type"] || "application/json";
+        }
+
         const response = await fetch(url, {
           ...options,
+          headers,
           signal: controller.signal,
-          headers: {
-            "User-Agent": "Yunabuju-ActivityPub-Directory/1.0",
-            ...options.headers,
-          },
           agent: new https.Agent({
             rejectUnauthorized: false,
             servername: parsedUrl.hostname,
@@ -570,7 +600,7 @@ export class KoreanActivityPubDiscovery {
 
         if (i === attempts - 1) throw error;
 
-        const delay = Math.min(1000 * Math.pow(2, i), 5000); // 최대 5초 대기
+        const delay = Math.min(1000 * Math.pow(2, i), 5000);
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
@@ -1345,42 +1375,109 @@ export class KoreanActivityPubDiscovery {
   }
 
   async isKoreanInstance(domain) {
-    try {
-      this.logger.info(`[${domain}] 한국어 서버 체크 시작`);
+    const startTime = performance.now();
 
-      // 더 짧은 타임아웃으로 NodeInfo 체크
+    try {
+      this.logger.info({
+        message: "Starting Korean server check",
+        domain,
+        timestamp: new Date().toISOString(),
+      });
+
+      // 캐시된 결과가 있는지 확인
+      const cachedResult = await this.pool.query(
+        "SELECT is_korean_server, korean_usage_rate FROM yunabuju_servers WHERE domain = $1 AND last_korean_check > NOW() - INTERVAL '1 day'",
+        [domain]
+      );
+
+      if (cachedResult.rows.length > 0) {
+        const { is_korean_server, korean_usage_rate } = cachedResult.rows[0];
+        this.koreanUsageRate = korean_usage_rate;
+
+        this.logger.info({
+          message: "Using cached Korean check result",
+          domain,
+          isKorean: is_korean_server,
+          koreanUsageRate: korean_usage_rate,
+          source: "cache",
+          processingTime: (performance.now() - startTime).toFixed(2),
+        });
+
+        return is_korean_server;
+      }
+
+      // NodeInfo 체크 (5초 타임아웃)
       const nodeInfo = await Promise.race([
         this.fetchNodeInfo(domain),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Timeout")), 5000)
+          setTimeout(() => reject(new Error("NodeInfo Timeout")), 5000)
         ),
-      ]).catch(() => null);
+      ]).catch((error) => {
+        this.logger.debug({
+          message: "NodeInfo check failed",
+          domain,
+          error: error.message,
+        });
+        return null;
+      });
 
       if (nodeInfo?.metadata?.languages?.includes("ko")) {
-        this.logger.info(`[${domain}] NodeInfo에서 한국어 지원 확인됨`);
         this.koreanUsageRate = 1.0;
+        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
+
+        this.logger.info({
+          message: "Korean support found in NodeInfo",
+          domain,
+          source: "nodeInfo",
+          koreanUsageRate: this.koreanUsageRate,
+          processingTime: (performance.now() - startTime).toFixed(2),
+        });
+
         return true;
       }
 
-      // 더 짧은 타임아웃으로 인스턴스 정보 체크
+      // 인스턴스 정보 체크 (5초 타임아웃)
       const instanceInfo = await Promise.race([
         this.fetchInstanceInfo(domain),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Timeout")), 5000)
+          setTimeout(() => reject(new Error("InstanceInfo Timeout")), 5000)
         ),
-      ]).catch(() => null);
+      ]).catch((error) => {
+        this.logger.debug({
+          message: "Instance info check failed",
+          domain,
+          error: error.message,
+        });
+        return null;
+      });
 
       if (!instanceInfo) {
-        this.logger.info(`[${domain}] 인스턴스 정보를 가져올 수 없음`);
+        this.logger.info({
+          message: "No instance info available",
+          domain,
+          processingTime: (performance.now() - startTime).toFixed(2),
+        });
+        await this.updateKoreanServerStatus(domain, false, 0);
         return false;
       }
 
+      // 언어 설정 체크
       if (instanceInfo.languages?.includes("ko")) {
-        this.logger.info(`[${domain}] 인스턴스 정보에서 한국어 지원 확인됨`);
         this.koreanUsageRate = 0.9;
+        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
+
+        this.logger.info({
+          message: "Korean support found in instance languages",
+          domain,
+          source: "instanceLanguages",
+          koreanUsageRate: this.koreanUsageRate,
+          processingTime: (performance.now() - startTime).toFixed(2),
+        });
+
         return true;
       }
 
+      // 서버 설명 체크
       const descriptions = [
         instanceInfo.description,
         instanceInfo.extended_description,
@@ -1389,23 +1486,79 @@ export class KoreanActivityPubDiscovery {
 
       for (const desc of descriptions) {
         if (this.containsKorean(desc)) {
-          this.logger.info(`[${domain}] 서버 설명에서 한국어 확인됨`);
           this.koreanUsageRate = 0.9;
+          await this.updateKoreanServerStatus(
+            domain,
+            true,
+            this.koreanUsageRate
+          );
+
+          this.logger.info({
+            message: "Korean text found in server description",
+            domain,
+            source: "description",
+            koreanUsageRate: this.koreanUsageRate,
+            processingTime: (performance.now() - startTime).toFixed(2),
+          });
+
           return true;
         }
       }
 
+      // 서버 규칙 체크
       if (instanceInfo.rules?.some((rule) => this.containsKorean(rule.text))) {
-        this.logger.info(`[${domain}] 서버 규칙에서 한국어 확인됨`);
         this.koreanUsageRate = 0.9;
+        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
+
+        this.logger.info({
+          message: "Korean text found in server rules",
+          domain,
+          source: "rules",
+          koreanUsageRate: this.koreanUsageRate,
+          processingTime: (performance.now() - startTime).toFixed(2),
+        });
+
         return true;
       }
 
-      this.logger.info(`[${domain}] 한국어 사용 흔적을 찾을 수 없음`);
-      this.koreanUsageRate = 0;
+      // 타임라인 분석
+      const timelineKoreanRate = await this.analyzeKoreanUsage(domain);
+      if (timelineKoreanRate > 0.3) {
+        this.koreanUsageRate = timelineKoreanRate;
+        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
+
+        this.logger.info({
+          message: "Korean usage found in timeline",
+          domain,
+          source: "timeline",
+          koreanUsageRate: this.koreanUsageRate,
+          processingTime: (performance.now() - startTime).toFixed(2),
+        });
+
+        return true;
+      }
+
+      // 한국어 서버가 아닌 것으로 판단
+      await this.updateKoreanServerStatus(domain, false, 0);
+
+      this.logger.info({
+        message: "Server determined as non-Korean",
+        domain,
+        processingTime: (performance.now() - startTime).toFixed(2),
+      });
+
       return false;
     } catch (error) {
-      this.logger.error(`[${domain}] 오류 발생:`, error);
+      const processingTime = performance.now() - startTime;
+
+      this.logger.error({
+        message: "Error in Korean server check",
+        domain,
+        error: error.message,
+        processingTime: processingTime.toFixed(2),
+      });
+
+      await this.updateKoreanServerStatus(domain, false, 0);
       return false;
     }
   }
