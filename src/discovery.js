@@ -157,6 +157,8 @@ export class KoreanActivityPubDiscovery {
                     domain: row.domain,
                     koreanUsageRate: this.koreanUsageRate,
                   });
+
+                  await this.updateKoreanServerStatus(domain, false);
                   return;
                 }
 
@@ -242,6 +244,8 @@ export class KoreanActivityPubDiscovery {
       "completed",
       "failed",
       "not_korean",
+      "suspicious", // 추가
+      "blocked", // 추가
     ];
     if (!validStatuses.includes(status)) {
       throw new Error(`Invalid status: ${status}`);
@@ -534,39 +538,80 @@ export class KoreanActivityPubDiscovery {
     }
   }
 
+  isAllowedContentType(contentType) {
+    if (!contentType) return true; // content type이 없으면 허용
+
+    // content type에서 기본 타입만 추출 (파라미터 제거)
+    const contentTypeBase = contentType.split(";")[0].trim().toLowerCase();
+
+    // +json 으로 끝나는 모든 타입 허용
+    if (contentTypeBase.endsWith("+json")) return true;
+
+    // application/xxx-json 형태의 타입 허용
+    if (
+      contentTypeBase.startsWith("application/") &&
+      contentTypeBase.endsWith("-json")
+    )
+      return true;
+
+    // 기본 허용 타입들
+    const allowedTypes = [
+      "application/json",
+      "application/activity+json",
+      "application/ld+json",
+      "text/html",
+      "text/plain",
+    ];
+
+    // 허용된 타입 목록과 비교
+    return allowedTypes.some((type) => contentTypeBase === type.toLowerCase());
+  }
+
   async fetchWithBackoff(url, options = {}, attempts = 3) {
     const parsedUrl = new URL(url);
-    const TIMEOUT = 2000;
+    const TIMEOUT = 5000;
     const MAX_RETRIES = 2;
-    const MAX_RESPONSE_SIZE = 1024 * 1024; // 1MB 제한
+    const MAX_RESPONSE_SIZE = 1024 * 1024; // 1MB limit
+
+    const agent = new https.Agent({
+      rejectUnauthorized: false,
+      servername: parsedUrl.hostname,
+      keepAlive: true,
+      timeout: TIMEOUT,
+      ALPNProtocols: ["http/1.1"],
+      minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.3",
+    });
 
     for (let i = 0; i < attempts; i++) {
+      let timeoutId;
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
+        timeoutId = setTimeout(() => controller.abort(), TIMEOUT);
 
         const headers = {
           "User-Agent": "Yunabuju-ActivityPub-Directory/1.0",
           ...options.headers,
         };
 
+        // Handle POST requests with body
         if (options.method === "POST" && options.body) {
           headers["Content-Type"] =
             headers["Content-Type"] || "application/json";
+
+          // Convert stream body to buffer if needed
+          if (options.body.pipe) {
+            options.body = await streamToBuffer(options.body);
+          }
         }
 
-        // HEAD 요청으로 사이즈 확인
+        // HEAD request to check size
         try {
           const headResponse = await fetch(url, {
             method: "HEAD",
             headers,
             signal: controller.signal,
-            agent: new https.Agent({
-              rejectUnauthorized: false,
-              servername: parsedUrl.hostname,
-              keepAlive: true,
-              timeout: 5000,
-            }),
+            agent,
           });
 
           const contentLength = parseInt(
@@ -574,7 +619,7 @@ export class KoreanActivityPubDiscovery {
           );
           const contentType = headResponse.headers.get("content-type");
 
-          // 응답 크기와 타입 DB에 기록
+          // Record response size and type
           await this.pool.query(
             `
             UPDATE yunabuju_servers 
@@ -587,7 +632,7 @@ export class KoreanActivityPubDiscovery {
             [parsedUrl.hostname, contentLength, contentType]
           );
 
-          // 응답 크기가 너무 크거나 허용되지 않은 content-type인 경우
+          // Check response size
           if (contentLength && contentLength > MAX_RESPONSE_SIZE) {
             await this.markServerAsSuspicious(
               parsedUrl.hostname,
@@ -597,50 +642,69 @@ export class KoreanActivityPubDiscovery {
             throw new Error(`Response too large: ${contentLength} bytes`);
           }
 
-          const allowedTypes = [
-            "application/json",
-            "application/activity+json",
-            "application/ld+json",
-            "text/html",
-            "text/plain",
-          ];
+          // Content type check - warn but continue
+          if (contentType && !this.isAllowedContentType(contentType)) {
+            this.logger.warn({
+              message: "Unexpected content type",
+              domain: parsedUrl.hostname,
+              contentType,
+              details:
+                "Server will continue to be processed but with a warning",
+            });
+          }
 
-          if (
-            contentType &&
-            !allowedTypes.some((type) => contentType.includes(type))
-          ) {
-            await this.markServerAsSuspicious(
-              parsedUrl.hostname,
-              "invalid_content_type",
-              contentType
-            );
-            throw new Error(`Invalid content type: ${contentType}`);
+          // Unblock servers previously blocked due to invalid content type
+          try {
+            const result = await this.pool.query(`
+              UPDATE yunabuju_servers 
+              SET 
+                is_active = true,
+                suspicious_reason = NULL,
+                suspicious_details = NULL,
+                blocked_until = NULL,
+                next_check_at = CURRENT_TIMESTAMP,
+                discovery_status = 'pending',
+                updated_at = CURRENT_TIMESTAMP
+              WHERE 
+                suspicious_reason = 'invalid_content_type' 
+                AND blocked_until > CURRENT_TIMESTAMP
+            `);
+
+            if (result.rowCount > 0) {
+              this.logger.info({
+                message:
+                  "Unblocked servers previously blocked due to invalid content type",
+                unblocked_count: result.rowCount,
+              });
+            }
+          } catch (error) {
+            this.logger.error({
+              message: "Error unblocking servers",
+              error: error.message,
+            });
           }
         } catch (headError) {
-          // HEAD 요청 실패 시 로깅만 하고 계속 진행
           this.logger.debug(
             `HEAD request failed for ${parsedUrl.hostname}: ${headError.message}`
           );
+        } finally {
+          clearTimeout(timeoutId);
         }
+
+        // Main request
+        const mainController = new AbortController();
+        timeoutId = setTimeout(() => mainController.abort(), TIMEOUT);
 
         const response = await fetch(url, {
           ...options,
           headers,
-          signal: controller.signal,
-          agent: new https.Agent({
-            rejectUnauthorized: false,
-            servername: parsedUrl.hostname,
-            keepAlive: true,
-            timeout: 5000,
-            ALPNProtocols: ["http/1.1"],
-            minVersion: "TLSv1.2",
-            maxVersion: "TLSv1.3",
-          }),
+          signal: mainController.signal,
+          agent,
+          // Remove body if undefined
+          ...(options.body ? { body: options.body } : {}),
         });
 
-        clearTimeout(timeoutId);
-
-        // 4xx는 조용히 처리
+        // Handle 4xx quietly
         if (response.status >= 400 && response.status < 500) {
           this.logger.debug({
             message: `Skipping ${response.status} error`,
@@ -662,29 +726,101 @@ export class KoreanActivityPubDiscovery {
         await this.resetServerFailure(parsedUrl.hostname);
         return response;
       } catch (error) {
+        const isLastAttempt = i === attempts - 1;
+
         if (error.code === "ENOTFOUND" || error.code === "EAI_AGAIN") {
           await this.updateServerFailure(parsedUrl.hostname);
-          throw new Error(`DNS lookup failed for ${parsedUrl.hostname}`);
-        }
-
-        if (error.name === "AbortError") {
-          if (i === MAX_RETRIES - 1) {
-            await this.updateServerFailure(parsedUrl.hostname);
+          if (isLastAttempt) {
+            throw new Error(`DNS lookup failed for ${parsedUrl.hostname}`);
+          }
+        } else if (error.name === "AbortError") {
+          await this.updateServerFailure(parsedUrl.hostname);
+          if (isLastAttempt) {
             throw new Error(
-              `Timeout after ${MAX_RETRIES} attempts for ${parsedUrl.hostname}`
+              `Timeout after ${attempts} attempts for ${parsedUrl.hostname}`
             );
           }
-          continue;
+        } else if (isLastAttempt) {
+          throw error;
         }
 
-        if (i === attempts - 1) throw error;
-
+        // Exponential backoff
         const delay = Math.min(1000 * Math.pow(2, i), 5000);
         await new Promise((resolve) => setTimeout(resolve, delay));
+      } finally {
+        clearTimeout(timeoutId);
       }
     }
 
     return null;
+  }
+  async validateSeedServers() {
+    const validSeeds = [];
+
+    for (const server of this.seedServers) {
+      try {
+        this.logger.info({
+          message: "Validating seed server",
+          server,
+          timestamp: new Date().toISOString(),
+        });
+
+        const isValid = await Promise.race([
+          this.checkServerConnectivity(server),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Validation timeout")), 3000)
+          ),
+        ]);
+
+        if (isValid) {
+          validSeeds.push(server);
+          this.logger.info({
+            message: "Seed server validated successfully",
+            server,
+          });
+        } else {
+          this.logger.warn({
+            message: "Seed server validation failed",
+            server,
+            reason: "Server unreachable",
+          });
+        }
+      } catch (error) {
+        this.logger.error({
+          message: "Seed server validation error",
+          server,
+          error: error.message,
+        });
+      }
+    }
+
+    if (validSeeds.length === 0) {
+      throw new Error("No valid seed servers found");
+    }
+
+    this.seedServers = validSeeds;
+    return validSeeds;
+  }
+
+  async checkServerConnectivity(domain) {
+    try {
+      const response = await this.fetchWithBackoff(
+        `https://${domain}/.well-known/nodeinfo`,
+        {},
+        1
+      );
+      return response !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  async streamToBuffer(stream) {
+    const chunks = [];
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
   }
 
   async markServerAsSuspicious(domain, reason, details) {
@@ -1063,9 +1199,12 @@ export class KoreanActivityPubDiscovery {
   }
 
   async discoverNewServers(depth = 2) {
+    await this.validateSeedServers();
+
     const processedServers = new Set();
     const newServers = new Set();
     const koreanServers = new Set();
+    const SERVER_TIMEOUT = 5000; // 5초로 수정
 
     // 시드 서버로 시작
     let currentDepthServers = new Set(this.seedServers);
@@ -1079,42 +1218,88 @@ export class KoreanActivityPubDiscovery {
         processedServers.add(server);
 
         try {
-          // 서버의 피어 가져오기
-          const { peers } = await this.fetchPeers(server);
-
-          // depth 1에서는 모든 피어를 검사
-          if (d === 0) {
-            for (const peer of peers) {
-              if (!processedServers.has(peer)) {
-                if (await this.isKoreanInstance(peer)) {
-                  koreanServers.add(peer);
-                  newServers.add(peer);
-                  currentDepthServers.add(peer); // 다음 depth에서 이 서버의 피어들을 검사
-                }
-              }
+          // 서버 처리에 5초 타임아웃 적용
+          await Promise.race([
+            this.processServerWithPeers(
+              server,
+              d,
+              processedServers,
+              newServers,
+              koreanServers,
+              currentDepthServers
+            ),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error("Server processing timeout")),
+                SERVER_TIMEOUT
+              )
+            ),
+          ]).catch(async (error) => {
+            if (error.message === "Server processing timeout") {
+              this.logger.warn({
+                message: "Server processing timed out",
+                server,
+                timeout: SERVER_TIMEOUT,
+              });
+              await this.markServerAsSuspicious(
+                server,
+                "processing_timeout",
+                `Server processing exceeded ${SERVER_TIMEOUT}ms timeout`
+              );
+            } else {
+              this.logger.error(`Error processing server ${server}:`, error);
             }
-          }
-          // depth 2 이상에서는 한국어 서버의 피어들만 검사
-          else {
-            if (koreanServers.has(server)) {
-              for (const peer of peers) {
-                if (!processedServers.has(peer)) {
-                  if (await this.isKoreanInstance(peer)) {
-                    koreanServers.add(peer);
-                    newServers.add(peer);
-                  }
-                }
-              }
-            }
-          }
+          });
         } catch (error) {
           this.logger.error(`Error processing server ${server}:`, error);
           continue;
         }
+
+        // 각 서버 처리 후 약간의 간격을 둠
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
 
     return Array.from(newServers);
+  }
+
+  // 서버 처리 로직을 별도 메소드로 분리
+  async processServerWithPeers(
+    server,
+    depth,
+    processedServers,
+    newServers,
+    koreanServers,
+    currentDepthServers
+  ) {
+    // 서버의 피어 가져오기
+    const { peers } = await this.fetchPeers(server);
+
+    // depth 1에서는 모든 피어를 검사
+    if (depth === 0) {
+      for (const peer of peers) {
+        if (!processedServers.has(peer)) {
+          if (await this.isKoreanInstance(peer)) {
+            koreanServers.add(peer);
+            newServers.add(peer);
+            currentDepthServers.add(peer); // 다음 depth에서 이 서버의 피어들을 검사
+          }
+        }
+      }
+    }
+    // depth 2 이상에서는 한국어 서버의 피어들만 검사
+    else {
+      if (koreanServers.has(server)) {
+        for (const peer of peers) {
+          if (!processedServers.has(peer)) {
+            if (await this.isKoreanInstance(peer)) {
+              koreanServers.add(peer);
+              newServers.add(peer);
+            }
+          }
+        }
+      }
+    }
   }
 
   async saveDiscoveryState(state) {
