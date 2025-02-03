@@ -1672,6 +1672,7 @@ export class KoreanActivityPubDiscovery {
 
   async isKoreanInstance(domain) {
     const startTime = performance.now();
+    const MIN_KOREAN_USAGE_RATE = 0.15; // 최소 한국어 사용률 기준
 
     try {
       this.logger.info({
@@ -1714,6 +1715,38 @@ export class KoreanActivityPubDiscovery {
       let korean_usage_rate = 0;
 
       if (isKorean) {
+        // 한국어 사용률 계산
+        if (timelineData) {
+          korean_usage_rate = this.analyzeTimelineContent(timelineData);
+        } else {
+          korean_usage_rate = 0.9; // 메타데이터에서 한글이 발견된 경우 기본값
+        }
+
+        // 한국어 사용률이 기준 이하면 한국어 서버가 아닌 것으로 처리
+        if (korean_usage_rate <= MIN_KOREAN_USAGE_RATE) {
+          await this.updateServerInDb({
+            domain,
+            isActive: true,
+            isKoreanServer: false,
+            koreanUsageRate: korean_usage_rate,
+            ...this.extractServerInfo(instanceInfo || {}),
+            hasNodeInfo: !!nodeInfo,
+            isPersonalInstance: isPersonal,
+            instanceType,
+            discovery_status: "not_korean",
+          });
+
+          this.logger.info({
+            message: "Server marked as not Korean due to low usage rate",
+            domain,
+            koreanUsageRate: korean_usage_rate,
+            threshold: MIN_KOREAN_USAGE_RATE,
+          });
+
+          await this.updateKoreanServerStatus(domain, false, korean_usage_rate);
+          return false;
+        }
+
         // 한국어 서버로 확인되면 바로 상세 정보 수집 및 저장
         if (!instanceInfo) {
           instanceInfo = await this.fetchInstanceInfo(domain).catch(() => null);
@@ -1725,13 +1758,6 @@ export class KoreanActivityPubDiscovery {
           instanceInfo,
           nodeInfo
         );
-
-        // 한국어 사용률 계산
-        if (timelineData) {
-          korean_usage_rate = this.analyzeTimelineContent(timelineData);
-        } else {
-          korean_usage_rate = 0.9; // 메타데이터에서 한글이 발견된 경우 기본값
-        }
 
         // DB에 모든 정보 저장
         await this.updateServerInDb({
@@ -1931,7 +1957,7 @@ export class KoreanActivityPubDiscovery {
           ...this.extractServerInfo(instanceInfo),
           hasNodeInfo: !!nodeInfo,
           isPersonalInstance: false, // 시드서버는 항상 false
-          instanceType, // 시드서버는 항상 community
+          instanceType: "community",
           discovery_status: "verified_seed",
         });
 
@@ -2015,5 +2041,39 @@ export class KoreanActivityPubDiscovery {
       registrationApprovalRequired:
         instanceInfo?.registrations?.approval_required ?? null,
     };
+  }
+
+  // 기존 DB 데이터 정리를 위한 메서드 추가
+  async cleanupLowUsageServers() {
+    const MIN_KOREAN_USAGE_RATE = 0.15;
+
+    const query = `
+      UPDATE yunabuju_servers 
+      SET 
+        is_korean_server = false,
+        discovery_status = 'not_korean',
+        updated_at = CURRENT_TIMESTAMP
+      WHERE 
+        is_korean_server = true 
+        AND korean_usage_rate <= $1
+    `;
+
+    try {
+      const result = await this.pool.query(query, [MIN_KOREAN_USAGE_RATE]);
+
+      this.logger.info({
+        message: "Cleaned up low usage Korean servers",
+        removedCount: result.rowCount,
+        threshold: MIN_KOREAN_USAGE_RATE,
+      });
+
+      return result.rowCount;
+    } catch (error) {
+      this.logger.error({
+        message: "Error cleaning up low usage servers",
+        error: error.message,
+      });
+      throw error;
+    }
   }
 }
