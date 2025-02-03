@@ -861,10 +861,27 @@ export class KoreanActivityPubDiscovery {
 
   async checkKoreanSupport(domain, nodeInfo) {
     try {
-      // NodeInfo 체크
       if (nodeInfo) {
+        // 디버그 로깅 추가
+        this.logger.debug({
+          message: "Checking Korean support",
+          domain,
+          metadata: nodeInfo.metadata,
+          containsKoreanInNodeName: this.containsKorean(
+            nodeInfo.metadata?.nodeName
+          ),
+          containsKoreanInNodeDesc: this.containsKorean(
+            nodeInfo.metadata?.nodeDescription
+          ),
+        });
+
         // 언어 목록 체크
         if (nodeInfo.metadata?.languages?.includes("ko")) {
+          this.logger.debug({
+            message: "Found Korean in languages list",
+            domain,
+            languages: nodeInfo.metadata.languages,
+          });
           return true;
         }
 
@@ -872,11 +889,21 @@ export class KoreanActivityPubDiscovery {
         const nodeInfoTexts = [
           nodeInfo.metadata?.nodeName,
           nodeInfo.metadata?.nodeDescription,
+          nodeInfo.metadata?.name,
           nodeInfo.metadata?.description,
+          nodeInfo.metadata?.maintainer?.name,
+          nodeInfo.metadata?.shortDescription,
         ].filter(Boolean);
 
-        if (nodeInfoTexts.some((text) => this.containsKorean(text))) {
-          return true;
+        for (const text of nodeInfoTexts) {
+          if (this.containsKorean(text)) {
+            this.logger.debug({
+              message: "Found Korean text in nodeinfo",
+              domain,
+              text,
+            });
+            return true;
+          }
         }
       }
 
@@ -890,74 +917,72 @@ export class KoreanActivityPubDiscovery {
         instanceInfo.rules?.some((rule) => this.containsKorean(rule.text))
       );
     } catch (error) {
+      this.logger.error({
+        message: "Error in checkKoreanSupport",
+        domain,
+        error: error.message,
+      });
       return false;
     }
   }
 
-  extractServerInfo(instanceInfo) {
-    return {
-      softwareName: instanceInfo.software?.name,
-      softwareVersion: instanceInfo.software?.version,
-      registrationOpen: instanceInfo.registrations?.enabled,
-      registrationApprovalRequired: instanceInfo.approval_required,
-      totalUsers: instanceInfo.stats?.user_count,
-      description: instanceInfo.description,
-      extendedDescription: instanceInfo.extended_description,
-      brandingServerDescription: instanceInfo.branding_server_description,
-    };
-  }
-
   async fetchNodeInfo(domain) {
     try {
-      const response = await this.fetchWithBackoff(
+      // 1. .well-known/nodeinfo에서 실제 NodeInfo 엔드포인트 URL 가져오기
+      const wellKnownResponse = await this.fetchWithBackoff(
         `https://${domain}/.well-known/nodeinfo`
       );
-      const contentType = response.headers.get("content-type");
-      if (!contentType?.includes("application/json")) {
-        this.logger.debug(
-          `Invalid content type from ${domain}: ${contentType}`
-        );
+
+      if (!wellKnownResponse) {
+        // 직접 nodeinfo 버전별 URL 시도
+        for (const version of ["2.0", "2.1"]) {
+          try {
+            const directResponse = await this.fetchWithBackoff(
+              `https://${domain}/nodeinfo/${version}`
+            );
+            if (directResponse) {
+              const data = await directResponse.json();
+              this.logger.debug({
+                message: "Found nodeinfo via direct URL",
+                domain,
+                version,
+              });
+              return data;
+            }
+          } catch (error) {
+            continue;
+          }
+        }
         return null;
       }
 
-      const text = await response.text();
-      let links;
-      try {
-        links = JSON.parse(text);
-      } catch (e) {
-        this.logger.debug(
-          `Invalid JSON from ${domain}: ${text.substring(0, 100)}...`
-        );
-        return null;
-      }
+      const wellKnownData = await wellKnownResponse.json();
+      if (!wellKnownData.links) return null;
 
-      const nodeInfoLink = links.links?.find(
-        (link) => link.rel === "http://nodeinfo.diaspora.software/ns/schema/2.0"
+      // 2. nodeinfo 2.0 또는 2.1 링크 찾기
+      const nodeInfoLink = wellKnownData.links.find((link) =>
+        link.rel.includes("nodeinfo.diaspora.software/ns/schema/2")
       );
 
-      if (!nodeInfoLink) return null;
+      if (!nodeInfoLink?.href) return null;
 
+      // 3. 실제 NodeInfo 데이터 가져오기
       const nodeInfoResponse = await this.fetchWithBackoff(nodeInfoLink.href);
-      const nodeInfoContentType = nodeInfoResponse.headers.get("content-type");
-      if (!nodeInfoContentType?.includes("application/json")) {
-        this.logger.debug(
-          `Invalid nodeinfo content type from ${domain}: ${nodeInfoContentType}`
-        );
-        return null;
-      }
+      if (!nodeInfoResponse) return null;
 
-      const nodeInfoText = await nodeInfoResponse.text();
-      try {
-        return JSON.parse(nodeInfoText);
-      } catch (e) {
-        this.logger.debug(
-          `Invalid nodeinfo JSON from ${domain}: ${nodeInfoText.substring(
-            0,
-            100
-          )}...`
-        );
-        return null;
-      }
+      const nodeInfoData = await nodeInfoResponse.json();
+
+      // 디버그 로깅 추가
+      this.logger.debug({
+        message: "Fetched nodeinfo data",
+        domain,
+        metadata: nodeInfoData.metadata,
+        languages: nodeInfoData.metadata?.languages,
+        nodeName: nodeInfoData.metadata?.nodeName,
+        nodeDescription: nodeInfoData.metadata?.nodeDescription,
+      });
+
+      return nodeInfoData;
     } catch (error) {
       this.logger.debug(
         `Error fetching nodeinfo from ${domain}: ${error.message}`
@@ -1047,7 +1072,10 @@ export class KoreanActivityPubDiscovery {
       stats: {
         user_count: nodeInfo.usage?.users?.total || 0,
       },
-      description: nodeInfo.metadata?.nodeName || "",
+      description:
+        nodeInfo.metadata?.nodeDescription || nodeInfo.metadata?.nodeName || "",
+      extended_description: nodeInfo.metadata?.nodeDescription || "",
+      branding_server_description: nodeInfo.metadata?.nodeName || "",
       rules: [],
       registrations: {
         enabled: nodeInfo.openRegistrations !== false,
@@ -1069,6 +1097,8 @@ export class KoreanActivityPubDiscovery {
         enabled: nodeInfo.openRegistrations !== false,
       },
       description: nodeInfo.metadata?.nodeName || "",
+      extended_description: nodeInfo.metadata?.nodeDescription || "",
+      branding_server_description: nodeInfo.metadata?.nodeName || "",
       rules: [],
     };
   }
@@ -1660,41 +1690,15 @@ export class KoreanActivityPubDiscovery {
         return false;
       }
 
-      // 4. NodeInfo 기반 체크
-      if (nodeInfo?.metadata?.languages?.includes("ko")) {
-        this.koreanUsageRate = 1.0;
+      // NodeInfo나 instanceInfo 데이터로 한국어 지원 여부 체크
+      const isKorean = await this.checkKoreanSupport(domain, nodeInfo || {});
+      if (isKorean) {
+        this.koreanUsageRate = 0.9; // 한글 설명이나 메타데이터가 있으면 높은 점수
         await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
         return true;
       }
 
-      // 5. Instance Info 기반 체크
-      if (instanceInfo?.languages?.includes("ko")) {
-        this.koreanUsageRate = 0.9;
-        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
-        return true;
-      }
-
-      // 6. 텍스트 기반 체크
-      if (instanceInfo) {
-        const textsToCheck = [
-          instanceInfo.description,
-          instanceInfo.extended_description,
-          instanceInfo.branding_server_description,
-          ...(instanceInfo.rules?.map((rule) => rule.text) || []),
-        ].filter(Boolean);
-
-        if (textsToCheck.some((text) => this.containsKorean(text))) {
-          this.koreanUsageRate = 0.9;
-          await this.updateKoreanServerStatus(
-            domain,
-            true,
-            this.koreanUsageRate
-          );
-          return true;
-        }
-      }
-
-      // 7. 타임라인 분석
+      // 타임라인 분석
       if (timelineData) {
         const koreanRate = this.analyzeTimelineContent(timelineData);
         if (koreanRate > 0.3) {
@@ -1708,7 +1712,7 @@ export class KoreanActivityPubDiscovery {
         }
       }
 
-      // 8. 한국어 서버가 아닌 것으로 판단
+      // 한국어 서버가 아닌 것으로 판단
       await this.updateKoreanServerStatus(domain, false, 0);
       return false;
     } catch (error) {
