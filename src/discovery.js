@@ -1,6 +1,9 @@
 import fetch from "node-fetch";
 import https from "https";
 import { performance } from "perf_hooks";
+import suspiciousDomainsData from "../suspicious-domains.json" assert { type: "json" };
+
+const { suspiciousDomains } = suspiciousDomainsData;
 
 export class KoreanActivityPubDiscovery {
   constructor(dbPool, logger) {
@@ -72,12 +75,13 @@ export class KoreanActivityPubDiscovery {
     const CONCURRENT_CHECKS = 20; // 동시에 처리할 서버 수
     const CHECK_INTERVAL = 50; // 배치 간 대기 시간 (ms)
     try {
-      // 전체 pending 서버 수 확인
+      // 전체 pending 서버 수 확인 쿼리 수정 - failed_attempts >= 3인 서버 제외
       const totalQuery = `
         SELECT COUNT(*) as total 
         FROM yunabuju_servers 
         WHERE discovery_batch_id = $1 
           AND discovery_status = 'pending'
+          AND (failed_attempts < 3 OR failed_attempts IS NULL)
       `;
       const {
         rows: [{ total }],
@@ -95,12 +99,13 @@ export class KoreanActivityPubDiscovery {
       let processedCount = 0;
 
       while (true) {
-        // BATCH_SIZE만큼의 pending 서버를 가져옴
+        // BATCH_SIZE만큼의 pending 서버를 가져오는 쿼리 수정 - failed_attempts >= 3인 서버 제외
         const query = `
           SELECT domain 
           FROM yunabuju_servers 
           WHERE discovery_batch_id = $1 
             AND discovery_status = 'pending'
+            AND (failed_attempts < 3 OR failed_attempts IS NULL)
           LIMIT $2
         `;
         const { rows: pendingServers } = await this.pool.query(query, [
@@ -127,6 +132,16 @@ export class KoreanActivityPubDiscovery {
           await Promise.all(
             batch.map(async (row) => {
               try {
+                // 스킵해야 하는 서버인지 확인
+                if (await this.shouldSkipServer(row.domain)) {
+                  this.logger.info({
+                    message: "Skipping blocked/failed server",
+                    domain: row.domain,
+                    batchId,
+                  });
+                  return;
+                }
+
                 // 상태를 in_progress로 업데이트
                 await this.updateServerStatus(
                   row.domain,
@@ -352,27 +367,10 @@ export class KoreanActivityPubDiscovery {
             break;
           }
         }
-        if (isPersonal) break; // 하나라도 찾으면 중단
+        if (isPersonal) break;
       }
 
-      // 2. 도메인 기반 체크
-      if (!isPersonal) {
-        const personalDomainKeywords = ["personal", "blog", "개인"];
-        if (
-          personalDomainKeywords.some((keyword) =>
-            domain.toLowerCase().includes(keyword)
-          )
-        ) {
-          isPersonal = true;
-          matchedDescription = {
-            source: "domain",
-            keyword: "domain-based",
-            text: domain,
-          };
-        }
-      }
-
-      // 3. NodeInfo 기반 체크
+      // NodeInfo 기반 체크
       if (!isPersonal && nodeInfo?.metadata?.singleUser === true) {
         isPersonal = true;
         matchedDescription = {
@@ -382,7 +380,7 @@ export class KoreanActivityPubDiscovery {
         };
       }
 
-      // 4. 사용자 수 기반 체크 (보조 지표로만 사용)
+      // 사용자 수 기반 체크 (보조 지표로만 사용)
       const userCount = instanceInfo?.stats?.user_count || 0;
       if (!isPersonal && userCount <= 3) {
         isPersonal = true;
@@ -393,7 +391,7 @@ export class KoreanActivityPubDiscovery {
         };
       }
 
-      // 5. 가입 정책 체크 (보조 지표)
+      // 가입 정책 체크 (보조 지표)
       if (
         !isPersonal &&
         instanceInfo?.registrations?.enabled === false &&
@@ -454,6 +452,15 @@ export class KoreanActivityPubDiscovery {
   }
 
   async processServer(domain) {
+    if (suspiciousDomains.includes(domain)) {
+      await this.markServerAsSuspicious(
+        domain,
+        "listed_in_suspicious_domains",
+        "Domain is listed in suspicious-domains.json"
+      );
+      return false;
+    }
+
     if (!(await this.shouldCheckServer(domain))) {
       const server = await this.getServerFromDb(domain);
       // 개인 인스턴스인 경우 false 반환하여 목록에서 제외
@@ -594,55 +601,58 @@ export class KoreanActivityPubDiscovery {
           ...options.headers,
         };
 
-        // Handle POST requests with body
-        if (options.method === "POST" && options.body) {
-          headers["Content-Type"] =
-            headers["Content-Type"] || "application/json";
-
-          // Convert stream body to buffer if needed
-          if (options.body.pipe) {
-            options.body = await streamToBuffer(options.body);
-          }
-        }
-
-        // HEAD request to check size
+        // HEAD 요청을 GET 요청으로 대체
         try {
-          const headResponse = await fetch(url, {
-            method: "HEAD",
+          const response = await fetch(url, {
+            method: "GET",
             headers,
             signal: controller.signal,
             agent,
           });
 
           const contentLength = parseInt(
-            headResponse.headers.get("content-length")
+            response.headers.get("content-length")
           );
-          const contentType = headResponse.headers.get("content-type");
+          const contentType = response.headers.get("content-type");
 
-          // Record response size and type
-          await this.pool.query(
-            `
-            UPDATE yunabuju_servers 
-            SET 
-              last_response_size = $2,
-              last_content_type = $3,
-              updated_at = CURRENT_TIMESTAMP
-            WHERE domain = $1
-          `,
-            [parsedUrl.hostname, contentLength, contentType]
-          );
-
-          // Check response size
-          if (contentLength && contentLength > MAX_RESPONSE_SIZE) {
-            await this.markServerAsSuspicious(
-              parsedUrl.hostname,
-              "large_response",
-              contentLength
+          // contentLength가 유효한 숫자인 경우에만 데이터베이스에 저장
+          if (!isNaN(contentLength)) {
+            await this.pool.query(
+              `
+              UPDATE yunabuju_servers 
+              SET 
+                last_response_size = $2,
+                last_content_type = $3,
+                updated_at = CURRENT_TIMESTAMP
+              WHERE domain = $1
+            `,
+              [parsedUrl.hostname, contentLength, contentType]
             );
-            throw new Error(`Response too large: ${contentLength} bytes`);
+
+            // Check response size
+            if (contentLength > MAX_RESPONSE_SIZE) {
+              await this.markServerAsSuspicious(
+                parsedUrl.hostname,
+                "large_response",
+                contentLength
+              );
+              throw new Error(`Response too large: ${contentLength} bytes`);
+            }
+          } else {
+            // contentLength가 유효하지 않은 경우 contentType만 업데이트
+            await this.pool.query(
+              `
+              UPDATE yunabuju_servers 
+              SET 
+                last_content_type = $2,
+                updated_at = CURRENT_TIMESTAMP
+              WHERE domain = $1
+            `,
+              [parsedUrl.hostname, contentType]
+            );
           }
 
-          // Content type check - warn but continue
+          // Content type check
           if (contentType && !this.isAllowedContentType(contentType)) {
             this.logger.warn({
               message: "Unexpected content type",
@@ -653,78 +663,15 @@ export class KoreanActivityPubDiscovery {
             });
           }
 
-          // Unblock servers previously blocked due to invalid content type
-          try {
-            const result = await this.pool.query(`
-              UPDATE yunabuju_servers 
-              SET 
-                is_active = true,
-                suspicious_reason = NULL,
-                suspicious_details = NULL,
-                blocked_until = NULL,
-                next_check_at = CURRENT_TIMESTAMP,
-                discovery_status = 'pending',
-                updated_at = CURRENT_TIMESTAMP
-              WHERE 
-                suspicious_reason = 'invalid_content_type' 
-                AND blocked_until > CURRENT_TIMESTAMP
-            `);
-
-            if (result.rowCount > 0) {
-              this.logger.info({
-                message:
-                  "Unblocked servers previously blocked due to invalid content type",
-                unblocked_count: result.rowCount,
-              });
-            }
-          } catch (error) {
-            this.logger.error({
-              message: "Error unblocking servers",
-              error: error.message,
-            });
-          }
-        } catch (headError) {
+          return response;
+        } catch (error) {
           this.logger.debug(
-            `HEAD request failed for ${parsedUrl.hostname}: ${headError.message}`
+            `Request failed for ${parsedUrl.hostname}: ${error.message}`
           );
-        } finally {
-          clearTimeout(timeoutId);
+          throw error;
         }
 
-        // Main request
-        const mainController = new AbortController();
-        timeoutId = setTimeout(() => mainController.abort(), TIMEOUT);
-
-        const response = await fetch(url, {
-          ...options,
-          headers,
-          signal: mainController.signal,
-          agent,
-          // Remove body if undefined
-          ...(options.body ? { body: options.body } : {}),
-        });
-
-        // Handle 4xx quietly
-        if (response.status >= 400 && response.status < 500) {
-          this.logger.debug({
-            message: `Skipping ${response.status} error`,
-            url: parsedUrl.hostname,
-            endpoint: url,
-            status: response.status,
-          });
-          return null;
-        }
-
-        if (!response.ok) {
-          if (response.status >= 500) {
-            await this.updateServerFailure(parsedUrl.hostname);
-            throw new Error(`Server error! status: ${response.status}`);
-          }
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-
-        await this.resetServerFailure(parsedUrl.hostname);
-        return response;
+        // ...existing code for main request...
       } catch (error) {
         const isLastAttempt = i === attempts - 1;
 
@@ -754,6 +701,7 @@ export class KoreanActivityPubDiscovery {
 
     return null;
   }
+
   async validateSeedServers() {
     const validSeeds = [];
 
@@ -913,8 +861,23 @@ export class KoreanActivityPubDiscovery {
 
   async checkKoreanSupport(domain, nodeInfo) {
     try {
-      if (nodeInfo.metadata?.languages?.includes("ko")) {
-        return true;
+      // NodeInfo 체크
+      if (nodeInfo) {
+        // 언어 목록 체크
+        if (nodeInfo.metadata?.languages?.includes("ko")) {
+          return true;
+        }
+
+        // NodeInfo의 텍스트 필드들 체크
+        const nodeInfoTexts = [
+          nodeInfo.metadata?.nodeName,
+          nodeInfo.metadata?.nodeDescription,
+          nodeInfo.metadata?.description,
+        ].filter(Boolean);
+
+        if (nodeInfoTexts.some((text) => this.containsKorean(text))) {
+          return true;
+        }
       }
 
       const instanceInfo = await this.fetchInstanceInfo(domain);
@@ -1201,105 +1164,65 @@ export class KoreanActivityPubDiscovery {
   async discoverNewServers(depth = 2) {
     await this.validateSeedServers();
 
-    const processedServers = new Set();
+    const processedServers = new Set(this.seedServers);
     const newServers = new Set();
     const koreanServers = new Set();
-    const SERVER_TIMEOUT = 5000; // 5초로 수정
+    const SERVER_TIMEOUT = 5000;
 
-    // 시드 서버로 시작
-    let currentDepthServers = new Set(this.seedServers);
+    // 시드서버들의 피어만 수집하고 검사
+    for (const seedServer of this.seedServers) {
+      try {
+        this.logger.info({
+          message: "Fetching peers from seed server",
+          seedServer,
+        });
 
-    for (let d = 0; d < depth; d++) {
-      const currentServers = Array.from(currentDepthServers);
-      currentDepthServers.clear();
+        const { peers } = await this.fetchPeers(seedServer);
 
-      for (const server of currentServers) {
-        if (processedServers.has(server)) continue;
-        processedServers.add(server);
-
-        try {
-          // 서버 처리에 5초 타임아웃 적용
-          await Promise.race([
-            this.processServerWithPeers(
-              server,
-              d,
-              processedServers,
-              newServers,
-              koreanServers,
-              currentDepthServers
-            ),
-            new Promise((_, reject) =>
-              setTimeout(
-                () => reject(new Error("Server processing timeout")),
-                SERVER_TIMEOUT
-              )
-            ),
-          ]).catch(async (error) => {
-            if (error.message === "Server processing timeout") {
-              this.logger.warn({
-                message: "Server processing timed out",
-                server,
-                timeout: SERVER_TIMEOUT,
-              });
-              await this.markServerAsSuspicious(
-                server,
-                "processing_timeout",
-                `Server processing exceeded ${SERVER_TIMEOUT}ms timeout`
-              );
-            } else {
-              this.logger.error(`Error processing server ${server}:`, error);
-            }
-          });
-        } catch (error) {
-          this.logger.error(`Error processing server ${server}:`, error);
-          continue;
-        }
-
-        // 각 서버 처리 후 약간의 간격을 둠
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    }
-
-    return Array.from(newServers);
-  }
-
-  // 서버 처리 로직을 별도 메소드로 분리
-  async processServerWithPeers(
-    server,
-    depth,
-    processedServers,
-    newServers,
-    koreanServers,
-    currentDepthServers
-  ) {
-    // 서버의 피어 가져오기
-    const { peers } = await this.fetchPeers(server);
-
-    // depth 1에서는 모든 피어를 검사
-    if (depth === 0) {
-      for (const peer of peers) {
-        if (!processedServers.has(peer)) {
-          if (await this.isKoreanInstance(peer)) {
-            koreanServers.add(peer);
-            newServers.add(peer);
-            currentDepthServers.add(peer); // 다음 depth에서 이 서버의 피어들을 검사
-          }
-        }
-      }
-    }
-    // depth 2 이상에서는 한국어 서버의 피어들만 검사
-    else {
-      if (koreanServers.has(server)) {
+        // 각 피어 검사
         for (const peer of peers) {
-          if (!processedServers.has(peer)) {
-            if (await this.isKoreanInstance(peer)) {
+          if (processedServers.has(peer)) continue;
+          processedServers.add(peer);
+
+          try {
+            // 서버 검사
+            const existingServer = await this.getServerFromDb(peer);
+            if (existingServer) {
+              if (existingServer.is_korean_server) {
+                koreanServers.add(peer);
+                newServers.add(peer);
+              }
+              continue;
+            }
+
+            const isKorean = await this.isKoreanInstance(peer);
+            if (isKorean) {
               koreanServers.add(peer);
               newServers.add(peer);
             }
+          } catch (error) {
+            this.logger.error(`Error processing peer ${peer}:`, error);
           }
+
+          // 각 피어 처리 후 잠시 대기
+          await new Promise((resolve) => setTimeout(resolve, 100));
         }
+      } catch (error) {
+        this.logger.error(
+          `Error fetching peers from seed server ${seedServer}:`,
+          error
+        );
       }
     }
+
+    this.logger.info({
+      message: "Discovery completed",
+      totalProcessed: processedServers.size,
+      newServersFound: newServers.size,
+      koreanServersFound: koreanServers.size,
+    });
+
+    return Array.from(newServers);
   }
 
   async saveDiscoveryState(state) {
@@ -1550,8 +1473,20 @@ export class KoreanActivityPubDiscovery {
       batchId || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
     try {
-      // 새 배치인 경우만 서버 발견
-      if (batchId.includes("-")) {
+      // 시드 서버 초기화
+      await this.initializeSeedServers();
+
+      // 새 배치인 경우에만 서버 발견
+      if (!batchId.includes("-")) {
+        this.logger.info({
+          message: "Using existing batch ID",
+          batchId,
+        });
+      } else {
+        this.logger.info({
+          message: "Starting new discovery batch",
+          batchId,
+        });
         const servers = await this.discoverNewServers(2);
         await this.insertNewServers(batchId, servers);
       }
@@ -1895,5 +1830,127 @@ export class KoreanActivityPubDiscovery {
 
     await this.startDiscovery(batchId);
     return true;
+  }
+
+  async initializeSeedServers() {
+    this.logger.info("Initializing seed servers...");
+
+    for (const domain of this.seedServers) {
+      try {
+        // 이미 DB에 있는지 확인
+        const existingServer = await this.getServerFromDb(domain);
+        if (
+          existingServer &&
+          existingServer.is_active &&
+          !existingServer.is_personal_instance
+        ) {
+          this.logger.info({
+            message: "Seed server already in database",
+            domain,
+            status: "skipping initialization",
+          });
+          continue;
+        }
+
+        this.logger.info({
+          message: "Initializing seed server",
+          domain,
+        });
+
+        // 서버 정보 수집
+        const nodeInfo = await this.fetchNodeInfo(domain);
+        const instanceInfo = await this.fetchInstanceInfo(domain);
+
+        // 시드서버는 항상 커뮤니티 서버로 간주
+        const instanceType = "community";
+        const isPersonal = false;
+
+        // 한국어 사용 여부 확인
+        const isKorean = await this.isKoreanInstance(domain);
+        const koreanUsageRate = isKorean
+          ? await this.analyzeKoreanUsage(domain)
+          : 0;
+
+        // DB에 저장
+        await this.updateServerInDb({
+          domain,
+          isActive: true,
+          isKoreanServer: isKorean,
+          koreanUsageRate,
+          ...this.extractServerInfo(instanceInfo),
+          hasNodeInfo: !!nodeInfo,
+          isPersonalInstance: false, // 시드서버는 항상 false
+          instanceType, // 시드서버는 항상 community
+          discovery_status: "verified_seed",
+        });
+
+        this.logger.info({
+          message: "Seed server initialized successfully",
+          domain,
+          isKorean,
+          instanceType: "community",
+        });
+      } catch (error) {
+        this.logger.error({
+          message: "Failed to initialize seed server",
+          domain,
+          error: error.message,
+        });
+        throw new Error(
+          `Failed to initialize seed server ${domain}: ${error.message}`
+        );
+      }
+    }
+  }
+
+  async shouldSkipServer(domain) {
+    const query = `
+      SELECT domain, failed_attempts, blocked_until
+      FROM yunabuju_servers
+      WHERE domain = $1 AND (
+        failed_attempts >= 3 OR
+        (blocked_until IS NOT NULL AND blocked_until > CURRENT_TIMESTAMP) OR
+        discovery_status = 'blocked'
+      )
+    `;
+
+    try {
+      const { rows } = await this.pool.query(query, [domain]);
+      if (rows.length > 0) {
+        const server = rows[0];
+        this.logger.debug({
+          message: "Skipping blocked/failed server",
+          domain,
+          failedAttempts: server.failed_attempts,
+          blockedUntil: server.blocked_until,
+        });
+        return true;
+      }
+      return false;
+    } catch (error) {
+      this.logger.error({
+        message: "Error checking server skip status",
+        domain,
+        error: error.message,
+      });
+      return false;
+    }
+  }
+
+  async analyzeKoreanUsage(domain) {
+    try {
+      const timelineData = await this.fetchTimelineData(domain);
+      if (!timelineData) return 0;
+
+      const koreanRate = this.analyzeTimelineContent(timelineData);
+      return koreanRate;
+    } catch (error) {
+      this.logger.debug({
+        message: "Error analyzing Korean usage",
+        domain,
+        error: error.message,
+      });
+      return 0;
+    }
   }
 }

@@ -6,12 +6,15 @@ import cron from "node-cron";
 import winston from "winston";
 import dotenv from "dotenv";
 import { setupDatabase } from "./database.js";
+import suspiciousDomainsData from "../suspicious-domains.json" assert { type: "json" };
 
-dotenv.config();
+dotenv.config(); // Ensure .env is loaded at the top
+
+const { suspiciousDomains } = suspiciousDomainsData;
 
 // 로거 설정
 const logger = winston.createLogger({
-  level: "info",
+  level: process.env.LOG_LEVEL || "info", // Use LOG_LEVEL from .env
   format: winston.format.combine(
     winston.format.timestamp(),
     winston.format.json()
@@ -57,6 +60,35 @@ async function startServer() {
     app.use(cors());
     app.use(express.json());
 
+    // Middleware to block suspicious domains
+    app.use((req, res, next) => {
+      const domain = req.hostname;
+      if (suspiciousDomains.includes(domain)) {
+        logger.warn(`Blocked access to suspicious domain: ${domain}`);
+        return res
+          .status(403)
+          .json({ error: "Access to this domain is blocked" });
+      }
+      next();
+    });
+
+    // Middleware to check admin access
+    function checkAdmin(req, res, next) {
+      const submittedPassword = req.query.password || req.body.password;
+      const adminPassword = process.env.ADMIN_PASSWORD;
+
+      if (!adminPassword) {
+        logger.error("ADMIN_PASSWORD not set in environment variables");
+        return res.status(500).json({ error: "Server configuration error" });
+      }
+
+      if (submittedPassword === adminPassword) {
+        next();
+      } else {
+        res.status(403).json({ error: "Invalid admin password" });
+      }
+    }
+
     // 디스커버리 인스턴스 생성
     const discovery = new KoreanActivityPubDiscovery(pool, logger);
 
@@ -72,8 +104,6 @@ async function startServer() {
         status: "running",
         endpoints: {
           servers: "/yunabuju/servers",
-          serversAll: "/yunabuju/servers/all",
-          discover: "/yunabuju/discover",
           discoverStatus: "/yunabuju/discover/status",
           status: "/yunabuju/status",
         },
@@ -84,18 +114,14 @@ async function startServer() {
     // API 라우트 - 기본 서버 목록 (가입 가능한 커뮤니티 서버만)
     app.get("/yunabuju/servers", async (req, res) => {
       try {
-        const includeClosedRegistration =
-          req.query.includeClosedRegistration === "true";
-        // 기본적으로 개인 인스턴스는 제외
-        const servers = await discovery.getKnownServers(
-          includeClosedRegistration,
-          true
-        );
+        const servers = await discovery.getKnownServers(false, true);
+        const response = servers.map((server) => ({
+          domain: server.domain,
+          description: server.description,
+        }));
         res.json({
-          total: servers.length,
-          registration_filtered: !includeClosedRegistration,
-          personal_instances_filtered: true,
-          servers: servers,
+          total: response.length,
+          servers: response,
         });
       } catch (error) {
         logger.error("Error fetching servers:", error);
@@ -103,17 +129,129 @@ async function startServer() {
       }
     });
 
-    // API 라우트 - 모든 서버 목록 (관리자용)
-    app.get("/yunabuju/servers/all", async (req, res) => {
+    // Admin login page
+    app.get("/yunabuju/admin", (req, res) => {
+      res.send(`
+        <html>
+          <head>
+            <title>Yunabuju Admin Login</title>
+            <style>
+              body { font-family: Arial, sans-serif; margin: 40px; }
+              .container { max-width: 400px; margin: 0 auto; }
+              .form-group { margin-bottom: 15px; }
+              label { display: block; margin-bottom: 5px; }
+              input { width: 100%; padding: 8px; }
+              button { padding: 10px 15px; background: #007bff; color: white; border: none; cursor: pointer; }
+              button:hover { background: #0056b3; }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>Yunabuju Admin Access</h1>
+              <form id="adminForm">
+                <div class="form-group">
+                  <label for="password">Admin Password:</label>
+                  <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit">Access Admin Data</button>
+              </form>
+              <div id="result"></div>
+            </div>
+            <script>
+              document.getElementById('adminForm').onsubmit = async (e) => {
+                e.preventDefault();
+                const password = document.getElementById('password').value;
+                const response = await fetch('/yunabuju/servers/all?password=' + encodeURIComponent(password));
+                if (response.ok) {
+                  window.location.href = '/yunabuju/servers/all?password=' + encodeURIComponent(password);
+                } else {
+                  document.getElementById('result').innerHTML = '<p style="color: red">Invalid password</p>';
+                }
+              };
+            </script>
+          </body>
+        </html>
+      `);
+    });
+
+    // Protected admin data endpoint with HTML response
+    app.get("/yunabuju/servers/all", checkAdmin, async (req, res) => {
       try {
         const includePersonal = req.query.includePersonal === "true";
         const servers = await discovery.getKnownServers(true, !includePersonal);
-        res.json({
-          total: servers.length,
-          registration_filtered: false,
-          personal_instances_filtered: !includePersonal,
-          servers: servers,
-        });
+
+        const html = `
+          <html>
+            <head>
+              <title>Yunabuju Server List</title>
+              <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                table { width: 100%; border-collapse: collapse; }
+                th, td { padding: 8px; text-align: left; border: 1px solid #ddd; }
+                th { background-color: #f4f4f4; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+                .filters { margin-bottom: 20px; }
+                .filters label { margin-right: 15px; }
+              </style>
+            </head>
+            <body>
+              <h1>Yunabuju Server List (Admin View)</h1>
+              <div class="filters">
+                <label>
+                  <input type="checkbox" id="includePersonal" ${
+                    includePersonal ? "checked" : ""
+                  }>
+                  Include Personal Instances
+                </label>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Domain</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Users</th>
+                    <th>Korean Usage</th>
+                    <th>Software</th>
+                    <th>Last Checked</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${servers
+                    .map(
+                      (server) => `
+                    <tr>
+                      <td>${server.domain}</td>
+                      <td>${server.instance_type || "unknown"}</td>
+                      <td>${server.is_active ? "Active" : "Inactive"}</td>
+                      <td>${server.total_users || "N/A"}</td>
+                      <td>${
+                        server.korean_usage_rate
+                          ? (server.korean_usage_rate * 100).toFixed(1) + "%"
+                          : "N/A"
+                      }</td>
+                      <td>${server.software_name || "N/A"} ${
+                        server.software_version || ""
+                      }</td>
+                      <td>${new Date(server.last_checked).toLocaleString()}</td>
+                    </tr>
+                  `
+                    )
+                    .join("")}
+                </tbody>
+              </table>
+              <script>
+                document.getElementById('includePersonal').onchange = function() {
+                  const currentUrl = new URL(window.location.href);
+                  currentUrl.searchParams.set('includePersonal', this.checked);
+                  window.location.href = currentUrl.toString();
+                };
+              </script>
+            </body>
+          </html>
+        `;
+
+        res.send(html);
       } catch (error) {
         logger.error("Error fetching all servers:", error);
         res.status(500).json({ error: "Internal server error" });
@@ -123,9 +261,13 @@ async function startServer() {
     // 수동으로 서버 검색을 시작하는 엔드포인트
     app.post("/yunabuju/discover", async (req, res) => {
       try {
-        const { resume } = req.query;
+        const { resume, preserveExisting } = req.query;
         logger.info(
-          `${resume ? "Resuming" : "Starting"} manual server discovery...`
+          `${
+            resume ? "Resuming" : "Starting"
+          } manual server discovery... (preserveExisting: ${
+            preserveExisting === "true"
+          })`
         );
 
         if (resume === "true") {
@@ -134,10 +276,13 @@ async function startServer() {
             return res.json({ message: "No unfinished batch found to resume" });
           }
         } else {
-          await discovery.startDiscovery();
+          // preserveExisting이 true인 경우 새로운 batchId 생성
+          const batchId =
+            preserveExisting === "true" ? `existing-${Date.now()}` : null;
+          await discovery.startDiscovery(batchId);
         }
 
-        const servers = await discovery.getKnownServers(true, true); // 개인 인스턴스 제외
+        const servers = await discovery.getKnownServers(true, true);
         logger.info(
           `Discovery ${resume ? "resumed and" : ""} completed. Found ${
             servers.length
