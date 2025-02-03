@@ -4,24 +4,48 @@ import pg from "pg";
 import { KoreanActivityPubDiscovery } from "./discovery.js";
 import cron from "node-cron";
 import winston from "winston";
+import "winston-daily-rotate-file"; // 추가
 import dotenv from "dotenv";
 import { setupDatabase } from "./database.js";
 import suspiciousDomainsData from "../suspicious-domains.json" assert { type: "json" };
+import fs from "fs";
+import path from "path";
 
 dotenv.config(); // Ensure .env is loaded at the top
 
+// logs 디렉토리 생성
+const logsDir = path.join(process.cwd(), "logs");
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir);
+}
+
 const { suspiciousDomains } = suspiciousDomainsData;
 
-// 로거 설정
+// 로그 설정 수정
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || "info", // Use LOG_LEVEL from .env
+  level: process.env.LOG_LEVEL || "info",
   format: winston.format.combine(
     winston.format.timestamp(),
     winston.format.json()
   ),
   transports: [
-    new winston.transports.File({ filename: "error.log", level: "error" }),
-    new winston.transports.File({ filename: "combined.log" }),
+    // 에러 로그 설정
+    new winston.transports.DailyRotateFile({
+      filename: "logs/error-%DATE%.log",
+      datePattern: "YYYY-MM-DD",
+      level: "error",
+      maxSize: "20m", // 20MB 초과시 새 파일
+      maxFiles: "14d", // 14일치 보관
+      zippedArchive: true, // 오래된 로그 압축
+    }),
+    // 전체 로그 설정
+    new winston.transports.DailyRotateFile({
+      filename: "logs/combined-%DATE%.log",
+      datePattern: "YYYY-MM-DD",
+      maxSize: "20m",
+      maxFiles: "14d",
+      zippedArchive: true,
+    }),
   ],
 });
 

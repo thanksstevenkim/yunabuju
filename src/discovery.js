@@ -1524,7 +1524,6 @@ export class KoreanActivityPubDiscovery {
   }
 
   async startDiscovery(batchId = null, resetBatch = false) {
-    // resetBatch 파라미터 추가
     batchId =
       batchId || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
@@ -1536,9 +1535,9 @@ export class KoreanActivityPubDiscovery {
           SET 
             discovery_batch_id = NULL,
             discovery_status = 'pending',
-            discovery_started_at = NULL,
+            discovery_started_at = CURRENT_TIMESTAMP,
             discovery_completed_at = NULL,
-            last_checked = NULL,
+            last_checked = CURRENT_TIMESTAMP,  -- NULL 대신 현재 시간으로 설정
             updated_at = CURRENT_TIMESTAMP
           WHERE discovery_batch_id IS NOT NULL
         `);
@@ -2004,5 +2003,17 @@ export class KoreanActivityPubDiscovery {
       });
       return 0;
     }
+  }
+
+  extractServerInfo(instanceInfo) {
+    return {
+      softwareName: instanceInfo?.software?.name || "unknown",
+      softwareVersion: instanceInfo?.software?.version || "",
+      totalUsers: instanceInfo?.stats?.user_count || 0,
+      description: instanceInfo?.description || "",
+      registrationOpen: instanceInfo?.registrations?.enabled ?? null,
+      registrationApprovalRequired:
+        instanceInfo?.registrations?.approval_required ?? null,
+    };
   }
 }

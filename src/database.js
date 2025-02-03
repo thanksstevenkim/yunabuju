@@ -138,19 +138,66 @@ async function setupDatabase() {
   }
 }
 
+// 데이터베이스 초기화 함수 추가
+async function resetDatabase() {
+  console.log("Starting database reset...");
+
+  const pool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+  });
+
+  try {
+    console.log("Connecting to database...");
+    const client = await pool.connect();
+
+    console.log("Dropping existing tables...");
+    await client.query(`
+      DROP TABLE IF EXISTS yunabuju_servers CASCADE;
+      DROP TABLE IF EXISTS yunabuju_discovery_state CASCADE;
+    `);
+
+    console.log("Creating tables from scratch...");
+    await client.query(createTableSQL);
+    await client.query(createDiscoveryStateTableSQL);
+
+    console.log("Database reset completed successfully");
+    client.release();
+  } catch (error) {
+    console.error("Error resetting database:", error);
+    throw error;
+  } finally {
+    await pool.end();
+  }
+}
+
 const currentFile = fileURLToPath(import.meta.url);
 
 if (process.argv[1] === currentFile) {
-  console.log("Running database setup directly...");
-  setupDatabase()
-    .then(() => {
-      console.log("Database setup completed successfully");
-      process.exit(0);
-    })
-    .catch((error) => {
-      console.error("Database setup failed:", error);
-      process.exit(1);
-    });
+  const command = process.argv[2];
+
+  if (command === "reset") {
+    console.log("Resetting database...");
+    resetDatabase()
+      .then(() => {
+        console.log("Database reset completed");
+        process.exit(0);
+      })
+      .catch((error) => {
+        console.error("Database reset failed:", error);
+        process.exit(1);
+      });
+  } else {
+    console.log("Running database setup directly...");
+    setupDatabase()
+      .then(() => {
+        console.log("Database setup completed successfully");
+        process.exit(0);
+      })
+      .catch((error) => {
+        console.error("Database setup failed:", error);
+        process.exit(1);
+      });
+  }
 }
 
-export { setupDatabase };
+export { setupDatabase, resetDatabase };
