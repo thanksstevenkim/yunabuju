@@ -1229,12 +1229,37 @@ export class KoreanActivityPubDiscovery {
             if (isKorean) {
               koreanServers.add(peer);
               newServers.add(peer);
+
+              // 한국어 서버로 확인되면 추가 정보 수집
+              const nodeInfo = await this.fetchNodeInfo(peer);
+              const instanceInfo = await this.fetchInstanceInfo(peer);
+              const { isPersonal, instanceType } =
+                await this.identifyInstanceType(peer, instanceInfo, nodeInfo);
+
+              // DB에 상세 정보 저장
+              await this.updateServerInDb({
+                domain: peer,
+                isActive: true,
+                isKoreanServer: true,
+                koreanUsageRate: this.koreanUsageRate,
+                ...this.extractServerInfo(instanceInfo),
+                hasNodeInfo: !!nodeInfo,
+                isPersonalInstance: isPersonal,
+                instanceType,
+                discovery_status: "completed",
+              });
+
+              this.logger.info({
+                message: "Korean peer server details saved",
+                domain: peer,
+                instanceType,
+                isPersonal,
+              });
             }
           } catch (error) {
             this.logger.error(`Error processing peer ${peer}:`, error);
           }
 
-          // 각 피어 처리 후 잠시 대기
           await new Promise((resolve) => setTimeout(resolve, 100));
         }
       } catch (error) {
@@ -1498,28 +1523,44 @@ export class KoreanActivityPubDiscovery {
     return result.rows;
   }
 
-  async startDiscovery(batchId = null) {
+  async startDiscovery(batchId = null, resetBatch = false) {
+    // resetBatch 파라미터 추가
     batchId =
       batchId || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
     try {
+      // 기존 배치 초기화 옵션
+      if (resetBatch) {
+        await this.pool.query(`
+          UPDATE yunabuju_servers
+          SET 
+            discovery_batch_id = NULL,
+            discovery_status = 'pending',
+            discovery_started_at = NULL,
+            discovery_completed_at = NULL,
+            last_checked = NULL,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE discovery_batch_id IS NOT NULL
+        `);
+
+        this.logger.info({
+          message: "Reset all existing batch data",
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       // 시드 서버 초기화
       await this.initializeSeedServers();
 
-      // 새 배치인 경우에만 서버 발견
-      if (!batchId.includes("-")) {
-        this.logger.info({
-          message: "Using existing batch ID",
-          batchId,
-        });
-      } else {
-        this.logger.info({
-          message: "Starting new discovery batch",
-          batchId,
-        });
-        const servers = await this.discoverNewServers(2);
-        await this.insertNewServers(batchId, servers);
-      }
+      // 새로운 배치 시작
+      this.logger.info({
+        message: "Starting new discovery batch",
+        batchId,
+        resetBatch,
+      });
+
+      const servers = await this.discoverNewServers(2);
+      await this.insertNewServers(batchId, servers);
 
       // pending 서버 처리
       await this.processPendingServers(batchId);
@@ -1596,7 +1637,8 @@ export class KoreanActivityPubDiscovery {
     return true;
   }
 
-  async updateKoreanServerStatus(domain, isKorean, koreanUsageRate = null) {
+  async updateKoreanServerStatus(domain, isKorean, koreanUsageRate = 0) {
+    // null 대신 0으로 기본값 변경
     const query = `
       UPDATE yunabuju_servers 
       SET 
@@ -1604,14 +1646,17 @@ export class KoreanActivityPubDiscovery {
         korean_usage_rate = $3,
         last_korean_check = CURRENT_TIMESTAMP,
         next_korean_check = CASE
-          WHEN $2 = false THEN null  -- 한국어 서버가 아닌 것으로 확인되면 영구적으로 캐시
-          ELSE CURRENT_TIMESTAMP + INTERVAL '1 day'  -- 한국어 서버인 경우 하루 후에 다시 체크
+          WHEN $2 = false THEN null
+          ELSE CURRENT_TIMESTAMP + INTERVAL '1 day'
         END,
         updated_at = CURRENT_TIMESTAMP
       WHERE domain = $1
     `;
 
-    await this.pool.query(query, [domain, isKorean, koreanUsageRate]);
+    // koreanUsageRate가 null이면 0으로 처리
+    const rate = koreanUsageRate === null ? 0 : koreanUsageRate;
+
+    await this.pool.query(query, [domain, isKorean, rate]);
 
     this.logger.info({
       message: `Korean server status updated`,
@@ -1634,7 +1679,7 @@ export class KoreanActivityPubDiscovery {
         timestamp: new Date().toISOString(),
       });
 
-      // 1. 캐시 체크
+      // 캐시 체크 (기존 코드)
       const cachedResult = await this.pool.query(
         "SELECT is_korean_server, korean_usage_rate FROM yunabuju_servers WHERE domain = $1 AND last_korean_check > NOW() - INTERVAL '1 day'",
         [domain]
@@ -1646,41 +1691,14 @@ export class KoreanActivityPubDiscovery {
         return is_korean_server;
       }
 
-      // 2. 기본 정보 수집 (병렬)
-      let instanceInfo = null;
-      let nodeInfo = null;
-      let timelineData = null;
+      // 서버 정보 수집 (병렬)
+      let [nodeInfo, instanceInfo, timelineData] = await Promise.all([
+        this.fetchNodeInfo(domain),
+        this.fetchInstanceInfo(domain).catch(() => null),
+        this.fetchTimelineData(domain).catch(() => null),
+      ]);
 
-      try {
-        [nodeInfo, instanceInfo, timelineData] = await Promise.all([
-          // NodeInfo 체크
-          Promise.race([
-            this.fetchNodeInfo(domain),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("NodeInfo Timeout")), 2000)
-            ),
-          ]).catch(() => null),
-
-          // Instance Info 체크
-          Promise.race([
-            this.fetchInstanceInfo(domain),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("Instance Timeout")), 2000)
-            ),
-          ]).catch(() => null),
-
-          // 타임라인 데이터 체크
-          this.fetchTimelineData(domain).catch(() => null),
-        ]);
-      } catch (error) {
-        this.logger.debug({
-          message: "Error fetching server information",
-          domain,
-          error: error.message,
-        });
-      }
-
-      // 3. 응답 데이터가 전혀 없으면 빠르게 실패
+      // 모든 정보가 없으면 실패
       if (!nodeInfo && !instanceInfo && !timelineData) {
         this.logger.debug({
           message: "No server information available",
@@ -1690,29 +1708,57 @@ export class KoreanActivityPubDiscovery {
         return false;
       }
 
-      // NodeInfo나 instanceInfo 데이터로 한국어 지원 여부 체크
+      // 한국어 서버 체크
       const isKorean = await this.checkKoreanSupport(domain, nodeInfo || {});
+      let korean_usage_rate = 0;
+
       if (isKorean) {
-        this.koreanUsageRate = 0.9; // 한글 설명이나 메타데이터가 있으면 높은 점수
-        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
+        // 한국어 서버로 확인되면 바로 상세 정보 수집 및 저장
+        if (!instanceInfo) {
+          instanceInfo = await this.fetchInstanceInfo(domain).catch(() => null);
+        }
+
+        // 인스턴스 유형 확인
+        const { isPersonal, instanceType } = await this.identifyInstanceType(
+          domain,
+          instanceInfo,
+          nodeInfo
+        );
+
+        // 한국어 사용률 계산
+        if (timelineData) {
+          korean_usage_rate = this.analyzeTimelineContent(timelineData);
+        } else {
+          korean_usage_rate = 0.9; // 메타데이터에서 한글이 발견된 경우 기본값
+        }
+
+        // DB에 모든 정보 저장
+        await this.updateServerInDb({
+          domain,
+          isActive: true,
+          isKoreanServer: true,
+          koreanUsageRate: korean_usage_rate,
+          ...this.extractServerInfo(instanceInfo || {}),
+          hasNodeInfo: !!nodeInfo,
+          isPersonalInstance: isPersonal,
+          instanceType,
+          discovery_status: "completed",
+        });
+
+        this.logger.info({
+          message: "Korean server details saved",
+          domain,
+          koreanUsageRate: korean_usage_rate,
+          instanceType,
+          isPersonal,
+        });
+
+        await this.updateKoreanServerStatus(domain, true, korean_usage_rate);
+        this.koreanUsageRate = korean_usage_rate;
         return true;
       }
 
-      // 타임라인 분석
-      if (timelineData) {
-        const koreanRate = this.analyzeTimelineContent(timelineData);
-        if (koreanRate > 0.3) {
-          this.koreanUsageRate = koreanRate;
-          await this.updateKoreanServerStatus(
-            domain,
-            true,
-            this.koreanUsageRate
-          );
-          return true;
-        }
-      }
-
-      // 한국어 서버가 아닌 것으로 판단
+      // 한국어 서버가 아닌 경우
       await this.updateKoreanServerStatus(domain, false, 0);
       return false;
     } catch (error) {

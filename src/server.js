@@ -261,13 +261,13 @@ async function startServer() {
     // 수동으로 서버 검색을 시작하는 엔드포인트
     app.post("/yunabuju/discover", async (req, res) => {
       try {
-        const { resume, preserveExisting } = req.query;
+        const { resume, preserveExisting, resetBatch } = req.query;
         logger.info(
           `${
             resume ? "Resuming" : "Starting"
           } manual server discovery... (preserveExisting: ${
             preserveExisting === "true"
-          })`
+          }, resetBatch: ${resetBatch === "true"})`
         );
 
         if (resume === "true") {
@@ -279,7 +279,7 @@ async function startServer() {
           // preserveExisting이 true인 경우 새로운 batchId 생성
           const batchId =
             preserveExisting === "true" ? `existing-${Date.now()}` : null;
-          await discovery.startDiscovery(batchId);
+          await discovery.startDiscovery(batchId, resetBatch === "true");
         }
 
         const servers = await discovery.getKnownServers(true, true);
