@@ -1580,9 +1580,9 @@ export class KoreanActivityPubDiscovery {
   async insertNewServers(batchId, domains) {
     const query = `
       INSERT INTO yunabuju_servers 
-        (domain, discovery_batch_id, discovery_status, discovery_started_at)
+        (domain, discovery_batch_id, discovery_status, discovery_started_at, last_checked)
       VALUES 
-        ($1, $2, 'pending', CURRENT_TIMESTAMP)
+        ($1, $2, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
       ON CONFLICT (domain) 
       DO UPDATE SET 
         discovery_batch_id = $2,
@@ -1597,7 +1597,9 @@ export class KoreanActivityPubDiscovery {
              OR yunabuju_servers.next_check_at < CURRENT_TIMESTAMP
           THEN CURRENT_TIMESTAMP
           ELSE yunabuju_servers.discovery_started_at
-        END
+        END,
+        last_checked = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
       WHERE yunabuju_servers.discovery_status IS NULL 
          OR yunabuju_servers.discovery_status = 'failed'
          OR yunabuju_servers.next_check_at < CURRENT_TIMESTAMP
