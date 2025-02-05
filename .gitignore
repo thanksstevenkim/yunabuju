@@ -1,4 +1,4 @@
 node_modules/
 .env
-*.log
+logs/
 suspicious-domains.json

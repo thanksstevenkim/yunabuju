@@ -23,6 +23,29 @@ export class KoreanActivityPubDiscovery {
       startTime: null,
       endTime: null,
     };
+    // 캐시 설정 추가
+    this.cache = new Map();
+    this.CACHE_TTL = 1000 * 60 * 60; // 1시간
+    this.BATCH_SIZE = 100;
+    this.CONCURRENT_LIMIT = 20;
+  }
+
+  // 캐시 관리 메서드 추가
+  getCached(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+    if (Date.now() - item.timestamp > this.CACHE_TTL) {
+      this.cache.delete(key);
+      return null;
+    }
+    return item.value;
+  }
+
+  setCache(key, value) {
+    this.cache.set(key, {
+      value,
+      timestamp: Date.now(),
+    });
   }
 
   async queueServerCheck(domain) {
@@ -575,6 +598,10 @@ export class KoreanActivityPubDiscovery {
   }
 
   async fetchWithBackoff(url, options = {}, attempts = 3) {
+    const cacheKey = `fetch:${url}:${JSON.stringify(options)}`;
+    const cached = this.getCached(cacheKey);
+    if (cached) return cached;
+
     const parsedUrl = new URL(url);
     const TIMEOUT = 5000;
     const MAX_RETRIES = 2;
@@ -663,6 +690,9 @@ export class KoreanActivityPubDiscovery {
             });
           }
 
+          if (response) {
+            this.setCache(cacheKey, response);
+          }
           return response;
         } catch (error) {
           this.logger.debug(
@@ -854,9 +884,23 @@ export class KoreanActivityPubDiscovery {
 
   containsKorean(text) {
     if (!text) return false;
+
+    // HTML 태그 제거
+    let cleanText = text.replace(/<[^>]*>/g, " ");
+
+    // 이스케이프된 문자 처리
+    cleanText = cleanText
+      .replace(/\\n/g, " ") // \n을 공백으로
+      .replace(/\\r/g, " ") // \r을 공백으로
+      .replace(/\\t/g, " ") // \t를 공백으로
+      .replace(/&[^;]+;/g, " ") // HTML 엔티티(&nbsp; 등) 제거
+      .replace(/\s+/g, " ") // 연속된 공백을 하나로
+      .trim();
+
+    // 한글 정규식 (닫는 / 추가)
     const koreanRegex =
       /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uD7B0-\uD7FF]/;
-    return koreanRegex.test(text);
+    return koreanRegex.test(cleanText);
   }
 
   async checkKoreanSupport(domain, nodeInfo) {
@@ -2075,5 +2119,112 @@ export class KoreanActivityPubDiscovery {
       });
       throw error;
     }
+  }
+
+  // 서버 정보 병렬 수집 최적화
+  async collectServerInfo(domain) {
+    const cacheKey = `serverInfo:${domain}`;
+    const cached = this.getCached(cacheKey);
+    if (cached) return cached;
+
+    const [nodeInfo, instanceInfo, timelineData] = await Promise.all([
+      this.fetchNodeInfo(domain).catch(() => null),
+      this.fetchInstanceInfo(domain).catch(() => null),
+      this.fetchTimelineData(domain).catch(() => null),
+    ]);
+
+    const result = { nodeInfo, instanceInfo, timelineData };
+    this.setCache(cacheKey, result);
+    return result;
+  }
+
+  // 배치 처리 최적화
+  async processBatch(servers, fn, concurrentLimit = this.CONCURRENT_LIMIT) {
+    const results = [];
+    for (let i = 0; i < servers.length; i += concurrentLimit) {
+      const batch = servers.slice(
+        i,
+        Math.min(i + concurrentLimit, servers.length)
+      );
+      const batchResults = await Promise.all(
+        batch.map((server) => fn(server).catch((error) => ({ error })))
+      );
+      results.push(...batchResults);
+
+      // 배치 사이에 짧은 대기 시간 추가
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return results;
+  }
+
+  // DB 쿼리 최적화를 위한 배치 업데이트
+  async batchUpdateServers(servers) {
+    if (servers.length === 0) return;
+
+    const query = `
+      INSERT INTO yunabuju_servers (
+        domain, is_active, korean_usage_rate, software_name,
+        software_version, registration_open, total_users,
+        description, has_nodeinfo, is_korean_server,
+        is_personal_instance, instance_type, last_checked,
+        discovery_status
+      )
+      SELECT * FROM UNNEST (
+        $1::varchar[], $2::boolean[], $3::float[], $4::varchar[],
+        $5::varchar[], $6::boolean[], $7::integer[],
+        $8::text[], $9::boolean[], $10::boolean[],
+        $11::boolean[], $12::varchar[], $13::timestamp[],
+        $14::varchar[]
+      )
+      ON CONFLICT (domain) DO UPDATE SET
+        is_active = EXCLUDED.is_active,
+        korean_usage_rate = EXCLUDED.korean_usage_rate,
+        /* ... other fields ... */
+        updated_at = CURRENT_TIMESTAMP;
+    `;
+
+    // 데이터 배열 준비
+    const params = servers.reduce((acc, server) => {
+      acc[0].push(server.domain);
+      acc[1].push(server.isActive);
+      // ... other fields ...
+      return acc;
+    }, Array(14).fill([]));
+
+    await this.pool.query(query, params);
+  }
+
+  // 서버 검색 프로세스 최적화
+  async discoverNewServers(depth = 2) {
+    // ...existing code...
+
+    // 피어 수집을 병렬로 처리
+    const peerCollectionPromises = this.seedServers.map(async (seedServer) => {
+      try {
+        const { peers } = await this.fetchPeers(seedServer);
+        return peers;
+      } catch (error) {
+        this.logger.error(`Error fetching peers from ${seedServer}:`, error);
+        return [];
+      }
+    });
+
+    const allPeers = new Set(
+      (await Promise.all(peerCollectionPromises)).flat()
+    );
+
+    // 피어 처리를 배치로 나누어 병렬 처리
+    const peers = Array.from(allPeers);
+    const results = await this.processBatch(peers, async (peer) => {
+      if (processedServers.has(peer)) return null;
+      processedServers.add(peer);
+
+      const serverInfo = await this.collectServerInfo(peer);
+      if (!serverInfo) return null;
+
+      // ... rest of the peer processing logic ...
+    });
+
+    // ... rest of the method ...
   }
 }
