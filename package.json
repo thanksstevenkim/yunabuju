@@ -1,6 +1,6 @@
 {
   "name": "yunabuju",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Automated Korean ActivityPub Server Aggregator",
   "keywords": [
     "[]"
@@ -25,6 +25,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "express-session": "^1.18.1",
     "node-cron": "^3.0.3",
     "node-fetch": "^3.3.2",
     "pg": "^8.13.1",

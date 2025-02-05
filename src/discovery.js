@@ -214,7 +214,7 @@ export class KoreanActivityPubDiscovery {
                   isActive: true,
                   isKoreanServer: true,
                   koreanUsageRate: this.koreanUsageRate,
-                  ...this.extractServerInfo(instanceInfo),
+                  ...this.extractServerInfo(instanceInfo, nodeInfo),
                   hasNodeInfo: !!nodeInfo,
                   isPersonalInstance: isPersonal,
                   instanceType,
@@ -517,7 +517,7 @@ export class KoreanActivityPubDiscovery {
           isActive: true,
           isPersonalInstance: true,
           instanceType: "personal",
-          ...this.extractServerInfo(instanceInfo),
+          ...this.extractServerInfo(instanceInfo, nodeInfo),
           hasNodeInfo: !!nodeInfo,
           isKoreanServer: false, // 개인 인스턴스는 한국어 서버 체크 안함
           koreanUsageRate: null,
@@ -542,7 +542,7 @@ export class KoreanActivityPubDiscovery {
         domain,
         isActive: true,
         koreanUsageRate,
-        ...this.extractServerInfo(instanceInfo),
+        ...this.extractServerInfo(instanceInfo, nodeInfo),
         hasNodeInfo: !!nodeInfo,
         isKoreanServer: true,
         isPersonalInstance: false,
@@ -600,7 +600,10 @@ export class KoreanActivityPubDiscovery {
   async fetchWithBackoff(url, options = {}, attempts = 3) {
     const cacheKey = `fetch:${url}:${JSON.stringify(options)}`;
     const cached = this.getCached(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      // 응답 복제하여 반환
+      return new Response(cached.body, cached);
+    }
 
     const parsedUrl = new URL(url);
     const TIMEOUT = 5000;
@@ -691,7 +694,9 @@ export class KoreanActivityPubDiscovery {
           }
 
           if (response) {
-            this.setCache(cacheKey, response);
+            // 응답 복제 후 캐시에 저장
+            const clonedResponse = response.clone();
+            this.setCache(cacheKey, clonedResponse);
           }
           return response;
         } catch (error) {
@@ -972,6 +977,10 @@ export class KoreanActivityPubDiscovery {
 
   async fetchNodeInfo(domain) {
     try {
+      const cacheKey = `nodeinfo:${domain}`;
+      const cached = this.getCached(cacheKey);
+      if (cached) return cached;
+
       // 1. .well-known/nodeinfo에서 실제 NodeInfo 엔드포인트 URL 가져오기
       const wellKnownResponse = await this.fetchWithBackoff(
         `https://${domain}/.well-known/nodeinfo`
@@ -1015,6 +1024,7 @@ export class KoreanActivityPubDiscovery {
       if (!nodeInfoResponse) return null;
 
       const nodeInfoData = await nodeInfoResponse.json();
+      this.setCache(cacheKey, nodeInfoData);
 
       // 디버그 로깅 추가
       this.logger.debug({
@@ -1286,7 +1296,7 @@ export class KoreanActivityPubDiscovery {
                 isActive: true,
                 isKoreanServer: true,
                 koreanUsageRate: this.koreanUsageRate,
-                ...this.extractServerInfo(instanceInfo),
+                ...this.extractServerInfo(instanceInfo, nodeInfo),
                 hasNodeInfo: !!nodeInfo,
                 isPersonalInstance: isPersonal,
                 instanceType,
@@ -1505,8 +1515,9 @@ export class KoreanActivityPubDiscovery {
         (domain, is_active, korean_usage_rate, software_name, software_version,
         registration_open, registration_approval_required, total_users,
         description, has_nodeinfo, is_korean_server, is_personal_instance,
-        instance_type, last_checked, discovery_status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, $14)
+        instance_type, last_checked, discovery_status, node_name, node_description)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 
+        CURRENT_TIMESTAMP, $14, $15, $16)
       ON CONFLICT (domain) 
       DO UPDATE SET 
         is_active = $2,
@@ -1521,6 +1532,8 @@ export class KoreanActivityPubDiscovery {
         is_korean_server = $11,
         is_personal_instance = $12,
         instance_type = $13,
+        node_name = $15,
+        node_description = $16,
         last_checked = CURRENT_TIMESTAMP,
         discovery_status = COALESCE($14, yunabuju_servers.discovery_status),
         updated_at = CURRENT_TIMESTAMP
@@ -1541,6 +1554,8 @@ export class KoreanActivityPubDiscovery {
       server.isPersonalInstance,
       server.instanceType,
       server.discovery_status,
+      server.nodeName,
+      server.nodeDescription,
     ]);
   }
 
@@ -1603,6 +1618,11 @@ export class KoreanActivityPubDiscovery {
       });
 
       const servers = await this.discoverNewServers(2);
+      if (!servers || servers.length === 0) {
+        this.logger.warn("No new servers discovered");
+        return batchId;
+      }
+
       await this.insertNewServers(batchId, servers);
 
       // pending 서버 처리
@@ -1773,7 +1793,7 @@ export class KoreanActivityPubDiscovery {
             isActive: true,
             isKoreanServer: false,
             koreanUsageRate: korean_usage_rate,
-            ...this.extractServerInfo(instanceInfo || {}),
+            ...this.extractServerInfo(instanceInfo, nodeInfo),
             hasNodeInfo: !!nodeInfo,
             isPersonalInstance: isPersonal,
             instanceType,
@@ -1809,7 +1829,7 @@ export class KoreanActivityPubDiscovery {
           isActive: true,
           isKoreanServer: true,
           koreanUsageRate: korean_usage_rate,
-          ...this.extractServerInfo(instanceInfo || {}),
+          ...this.extractServerInfo(instanceInfo, nodeInfo),
           hasNodeInfo: !!nodeInfo,
           isPersonalInstance: isPersonal,
           instanceType,
@@ -1998,7 +2018,7 @@ export class KoreanActivityPubDiscovery {
           isActive: true,
           isKoreanServer: isKorean,
           koreanUsageRate,
-          ...this.extractServerInfo(instanceInfo),
+          ...this.extractServerInfo(instanceInfo, nodeInfo),
           hasNodeInfo: !!nodeInfo,
           isPersonalInstance: false, // 시드서버는 항상 false
           instanceType: "community",
@@ -2075,12 +2095,15 @@ export class KoreanActivityPubDiscovery {
     }
   }
 
-  extractServerInfo(instanceInfo) {
+  extractServerInfo(instanceInfo, nodeInfo) {
     return {
       softwareName: instanceInfo?.software?.name || "unknown",
       softwareVersion: instanceInfo?.software?.version || "",
       totalUsers: instanceInfo?.stats?.user_count || 0,
       description: instanceInfo?.description || "",
+      nodeName: nodeInfo?.metadata?.nodeName || instanceInfo?.title || "",
+      nodeDescription:
+        nodeInfo?.metadata?.nodeDescription || instanceInfo?.description || "",
       registrationOpen: instanceInfo?.registrations?.enabled ?? null,
       registrationApprovalRequired:
         instanceInfo?.registrations?.approval_required ?? null,

@@ -10,6 +10,7 @@ import { setupDatabase } from "./database.js";
 import suspiciousDomainsData from "../suspicious-domains.json" assert { type: "json" };
 import fs from "fs";
 import path from "path";
+import session from "express-session";
 
 dotenv.config(); // Ensure .env is loaded at the top
 
@@ -81,6 +82,21 @@ async function startServer() {
     await initializeServer();
 
     const app = express();
+
+    // 세션 미들웨어 추가
+    app.use(
+      session({
+        secret: process.env.SESSION_SECRET || "yunabuju-secret",
+        resave: false,
+        saveUninitialized: false,
+        cookie: {
+          secure: process.env.NODE_ENV === "production",
+          httpOnly: true,
+          maxAge: 24 * 60 * 60 * 1000, // 24시간
+        },
+      })
+    );
+
     app.use(cors());
     app.use(express.json());
 
@@ -113,6 +129,40 @@ async function startServer() {
       }
     }
 
+    // 새로운 인증 및 세션 미들웨어 설정
+    app.use(
+      session({
+        secret: process.env.SESSION_SECRET || "yunabuju-secret",
+        resave: false,
+        saveUninitialized: false,
+        cookie: { secure: process.env.NODE_ENV === "production" },
+      })
+    );
+
+    // 인증 미들웨어
+    const authMiddleware = (req, res, next) => {
+      if (req.session?.isAdmin) {
+        next();
+      } else {
+        res.redirect("/yunabuju/admin");
+      }
+    };
+
+    // 로그인 처리
+    app.post(
+      "/yunabuju/auth",
+      express.urlencoded({ extended: true }),
+      (req, res) => {
+        const { password } = req.body;
+        if (password === process.env.ADMIN_PASSWORD) {
+          req.session.isAdmin = true;
+          res.redirect("/yunabuju/servers/all");
+        } else {
+          res.redirect("/yunabuju/admin");
+        }
+      }
+    );
+
     // 디스커버리 인스턴스 생성
     const discovery = new KoreanActivityPubDiscovery(pool, logger);
 
@@ -138,25 +188,66 @@ async function startServer() {
       });
     });
 
-    // API 라우트 - 기본 서버 목록 (가입 가능한 커뮤니티 서버만)
+    // API 라우트 수정 - 기본 서버 목록 (가입 가능한 커뮤니티 서버만)
     app.get("/yunabuju/servers", async (req, res) => {
       try {
         const servers = await discovery.getKnownServers(false, true);
-        const response = servers.map((server) => ({
-          domain: server.domain,
-          description: server.description,
-        }));
-        res.json({
-          total: response.length,
-          servers: response,
-        });
+
+        const html = `
+          <html>
+            <head>
+              <title>Yunabuju Server List</title>
+              <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                table { width: 100%; border-collapse: collapse; }
+                th, td { padding: 8px; text-align: left; border: 1px solid #ddd; }
+                th { background-color: #f4f4f4; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+              </style>
+            </head>
+            <body>
+              <h1>Korean ActivityPub Server List</h1>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Server Name</th>
+                    <th>Domain</th>
+                    <th>Description</th>
+                    <th>Software</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${servers
+                    .sort((a, b) => (b.total_users || 0) - (a.total_users || 0))
+                    .map(
+                      (server) => `
+                    <tr>
+                      <td>${server.node_name || "Unknown"}</td>
+                      <td>${server.domain}</td>
+                      <td>${
+                        server.node_description || server.description || ""
+                      }</td>
+                      <td>${server.software_name || "N/A"} ${
+                        server.software_version || ""
+                      }</td>
+                    </tr>
+                  `
+                    )
+                    .join("")}
+                </tbody>
+              </table>
+            </body>
+          </html>
+        `;
+
+        res.send(html);
       } catch (error) {
         logger.error("Error fetching servers:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
 
-    // Admin login page
+    // Admin login page - 수정된 버전
     app.get("/yunabuju/admin", (req, res) => {
       res.send(`
         <html>
@@ -175,36 +266,23 @@ async function startServer() {
           <body>
             <div class="container">
               <h1>Yunabuju Admin Access</h1>
-              <form id="adminForm">
+              <form action="/yunabuju/auth" method="POST">
                 <div class="form-group">
                   <label for="password">Admin Password:</label>
                   <input type="password" id="password" name="password" required>
                 </div>
                 <button type="submit">Access Admin Data</button>
               </form>
-              <div id="result"></div>
             </div>
-            <script>
-              document.getElementById('adminForm').onsubmit = async (e) => {
-                e.preventDefault();
-                const password = document.getElementById('password').value;
-                const response = await fetch('/yunabuju/servers/all?password=' + encodeURIComponent(password));
-                if (response.ok) {
-                  window.location.href = '/yunabuju/servers/all?password=' + encodeURIComponent(password);
-                } else {
-                  document.getElementById('result').innerHTML = '<p style="color: red">Invalid password</p>';
-                }
-              };
-            </script>
           </body>
         </html>
       `);
     });
 
-    // Protected admin data endpoint with HTML response
-    app.get("/yunabuju/servers/all", checkAdmin, async (req, res) => {
+    // Protected admin data endpoint - 수정된 버전
+    app.get("/yunabuju/servers/all", authMiddleware, async (req, res) => {
       try {
-        const includePersonal = req.query.includePersonal === "true";
+        const includePersonal = req.session.showPersonal || false;
         const servers = await discovery.getKnownServers(true, !includePersonal);
 
         const html = `
@@ -224,17 +302,21 @@ async function startServer() {
             <body>
               <h1>Yunabuju Server List (Admin View)</h1>
               <div class="filters">
-                <label>
-                  <input type="checkbox" id="includePersonal" ${
-                    includePersonal ? "checked" : ""
-                  }>
-                  Include Personal Instances
-                </label>
+                <form id="filterForm" method="POST" action="/yunabuju/servers/all/filters">
+                  <label>
+                    <input type="checkbox" name="includePersonal" ${
+                      includePersonal ? "checked" : ""
+                    } onchange="this.form.submit()">
+                    Include Personal Instances
+                  </label>
+                </form>
               </div>
               <table>
                 <thead>
                   <tr>
+                    <th>Server Name</th>
                     <th>Domain</th>
+                    <th>Description</th>
                     <th>Type</th>
                     <th>Status</th>
                     <th>Users</th>
@@ -245,10 +327,15 @@ async function startServer() {
                 </thead>
                 <tbody>
                   ${servers
+                    .sort((a, b) => (b.total_users || 0) - (a.total_users || 0))
                     .map(
                       (server) => `
                     <tr>
+                      <td>${server.node_name || "Unknown"}</td>
                       <td>${server.domain}</td>
+                      <td>${
+                        server.node_description || server.description || ""
+                      }</td>
                       <td>${server.instance_type || "unknown"}</td>
                       <td>${server.is_active ? "Active" : "Inactive"}</td>
                       <td>${server.total_users || "N/A"}</td>
@@ -283,6 +370,12 @@ async function startServer() {
         logger.error("Error fetching all servers:", error);
         res.status(500).json({ error: "Internal server error" });
       }
+    });
+
+    // 필터 설정 처리 - 수정된 버전
+    app.post("/yunabuju/servers/all/filters", authMiddleware, (req, res) => {
+      req.session.showPersonal = req.body.showPersonal === "on";
+      res.redirect("/yunabuju/servers/all");
     });
 
     // 수동으로 서버 검색을 시작하는 엔드포인트

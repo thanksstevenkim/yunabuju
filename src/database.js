@@ -37,7 +37,9 @@ const createTableSQL = `
     suspicious_details TEXT,
     blocked_until TIMESTAMP,
     last_response_size BIGINT,
-    last_content_type VARCHAR(100)
+    last_content_type VARCHAR(100),
+    node_name VARCHAR(255),
+    node_description TEXT
   );
 `;
 
@@ -120,6 +122,20 @@ async function setupDatabase() {
         BEGIN
           ALTER TABLE yunabuju_servers
             ADD COLUMN last_content_type VARCHAR(100);
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE yunabuju_servers
+            ADD COLUMN node_name VARCHAR(255);
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE yunabuju_servers
+            ADD COLUMN node_description TEXT;
         EXCEPTION
           WHEN duplicate_column THEN NULL;
         END;
