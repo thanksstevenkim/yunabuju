@@ -344,48 +344,95 @@ export class KoreanActivityPubDiscovery {
         { text: instanceInfo?.short_description, source: "short_description" },
         { text: instanceInfo?.branding_server_description, source: "branding" },
         { text: instanceInfo?.extended_description, source: "extended" },
+        {
+          text: nodeInfo?.metadata?.nodeDescription,
+          source: "nodeinfo_description",
+        },
+        { text: nodeInfo?.metadata?.nodeName, source: "nodeinfo_name" },
+      ].filter((desc) => desc.text); // null/undefined 제거
+
+      // 개인 서버 패턴
+      const personalPatterns = [
+        // 지인 관련 패턴
+        {
+          pattern: /(?:지인|친구).*(?:위주|전용|서버|공개|한정)/i,
+          type: "acquaintance_only",
+        },
+        {
+          pattern: /(?:위주|전용|한정).*(?:지인|친구)/i,
+          type: "acquaintance_only",
+        },
+
+        // 개인 관련 패턴
+        { pattern: /개인(?:용|적|서버|만|으로|이|을)/i, type: "personal" },
+        { pattern: /개인적(?:으로|인|인\s*용도|용도)/i, type: "personal" },
+        { pattern: /(?:혼자|본인).*(?:사용|운영)/i, type: "personal" },
+        { pattern: /(?:사용|운영).*(?:혼자|본인)/i, type: "personal" },
+
+        // 1인용 패턴
+        { pattern: /(?:1|일)인용?(?:서버)?/i, type: "single_user" },
+
+        // 비공개/제한 패턴
+        { pattern: /비공개(?:서버)?/i, type: "private" },
+        { pattern: /초대(?:제|전용|만)/i, type: "invite_only" },
+
+        // 관리자 패턴
+        { pattern: /(?:관리자|운영자).*(?:전용|만|개인)/i, type: "admin_only" },
+        { pattern: /(?:전용|만).*(?:관리자|운영자)/i, type: "admin_only" },
       ];
 
-      // 개인 서버 키워드
-      const personalKeywords = ["개인적", "개인", "개인용", "1인", "비공개"];
-
-      // 각 설명을 개별적으로 확인
+      // 각 설명에서 패턴 검사
       for (const desc of descriptions) {
-        if (!desc.text) continue;
-
-        const descText = desc.text.toLowerCase();
-        for (const keyword of personalKeywords) {
-          if (descText.includes(keyword)) {
-            isPersonal = true;
-            matchedDescription = {
-              source: desc.source,
-              keyword: keyword,
+        for (const { pattern, type } of personalPatterns) {
+          if (pattern.test(desc.text)) {
+            this.logger.debug({
+              message: "Personal instance pattern matched",
+              domain,
               text: desc.text,
+              pattern: pattern.toString(),
+              type,
+            });
+
+            return {
+              isPersonal: true,
+              instanceType: "personal",
+              matchedDescription: {
+                source: desc.source,
+                type,
+                text: desc.text,
+                pattern: pattern.toString(),
+              },
             };
-            break;
           }
         }
-        if (isPersonal) break;
       }
 
       // NodeInfo 기반 체크
-      if (!isPersonal && nodeInfo?.metadata?.singleUser === true) {
-        isPersonal = true;
-        matchedDescription = {
-          source: "nodeinfo",
-          keyword: "singleUser",
-          text: "nodeinfo.metadata.singleUser === true",
+      if (nodeInfo?.metadata?.singleUser === true) {
+        return {
+          isPersonal: true,
+          instanceType: "personal",
+          matchedDescription: {
+            source: "nodeinfo",
+            type: "single_user_flag",
+            text: "metadata.singleUser === true",
+          },
         };
       }
 
-      // 사용자 수 기반 체크 (보조 지표로만 사용)
-      const userCount = instanceInfo?.stats?.user_count || 0;
-      if (!isPersonal && userCount <= 3) {
-        isPersonal = true;
-        matchedDescription = {
-          source: "user_count",
-          keyword: "low_users",
-          text: `user count: ${userCount}`,
+      // 사용자 수 기반 체크 (보조 지표)
+      const userCount =
+        instanceInfo?.stats?.user_count || nodeInfo?.usage?.users?.total || 0;
+
+      if (userCount <= 3) {
+        return {
+          isPersonal: true,
+          instanceType: "personal",
+          matchedDescription: {
+            source: "user_count",
+            type: "low_users",
+            text: `user count: ${userCount}`,
+          },
         };
       }
 
@@ -1050,6 +1097,8 @@ export class KoreanActivityPubDiscovery {
         user_count: data.stats?.users || data.stats?.user_count || 0,
       },
       description: data.description || "",
+      short_description: data.short_description || "", // short_description 추가
+      title: data.title || "", // title 필드 추가
       rules: data.rules || [],
       registrations: {
         enabled:
@@ -1434,8 +1483,8 @@ export class KoreanActivityPubDiscovery {
         (domain, is_active, korean_usage_rate, software_name, software_version,
         registration_open, registration_approval_required, total_users,
         description, has_nodeinfo, is_korean_server, is_personal_instance,
-        instance_type, last_checked, discovery_status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, $14)
+        instance_type, last_checked, discovery_status, node_name, node_description)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, $14, $15, $16)
       ON CONFLICT (domain) 
       DO UPDATE SET 
         is_active = $2,
@@ -1450,6 +1499,8 @@ export class KoreanActivityPubDiscovery {
         is_korean_server = $11,
         is_personal_instance = $12,
         instance_type = $13,
+        node_name = $15,
+        node_description = $16,
         last_checked = CURRENT_TIMESTAMP,
         discovery_status = COALESCE($14, yunabuju_servers.discovery_status),
         updated_at = CURRENT_TIMESTAMP
@@ -1470,7 +1521,16 @@ export class KoreanActivityPubDiscovery {
       server.isPersonalInstance,
       server.instanceType,
       server.discovery_status,
+      server.nodeName, // 추가
+      server.nodeDescription, // 추가
     ]);
+
+    this.logger.debug({
+      message: "Server info updated in DB",
+      domain: server.domain,
+      nodeName: server.nodeName,
+      nodeDescription: server.nodeDescription?.substring(0, 50) + "...", // 로깅 시 긴 설명은 잘라서 표시
+    });
   }
 
   async getKnownServers(
@@ -1695,7 +1755,99 @@ export class KoreanActivityPubDiscovery {
       // NodeInfo나 instanceInfo 데이터로 한국어 지원 여부 체크
       const isKorean = await this.checkKoreanSupport(domain, nodeInfo || {});
       if (isKorean) {
-        this.koreanUsageRate = 0.9; // 한글 설명이나 메타데이터가 있으면 높은 점수
+        let koreanRate = 0;
+
+        if (timelineData) {
+          koreanRate = this.analyzeTimelineContent(timelineData);
+          this.logger.debug({
+            message: "Analyzed timeline Korean usage",
+            domain,
+            koreanRate,
+            postsAnalyzed: timelineData.data?.length || 0,
+          });
+
+          // 타임라인이 있는 경우 15% 기준 적용
+          if (koreanRate < 0.15) {
+            this.logger.info({
+              message: "Server rejected as Korean - low timeline usage",
+              domain,
+              koreanRate,
+            });
+            await this.updateKoreanServerStatus(domain, false, koreanRate);
+            return false;
+          }
+        } else {
+          // 타임라인이 없는 경우 설명의 한국어 비율 계산
+          const descriptions = [
+            nodeInfo?.metadata?.nodeDescription,
+            nodeInfo?.metadata?.nodeName,
+            instanceInfo?.description,
+            instanceInfo?.title,
+          ]
+            .filter(Boolean)
+            .join(" ");
+
+          if (descriptions) {
+            const textLength = descriptions.length;
+            const koreanTextLength = descriptions
+              .split("")
+              .filter((char) =>
+                /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uD7B0-\uD7FF]/.test(
+                  char
+                )
+              ).length;
+
+            koreanRate = koreanTextLength / textLength;
+
+            this.logger.debug({
+              message: "Analyzed description Korean usage (no timeline)",
+              domain,
+              koreanRate,
+              totalLength: textLength,
+              koreanLength: koreanTextLength,
+              description: descriptions.substring(0, 100) + "...",
+            });
+
+            // 설명에서 한국어 비율이 90% 미만이면 거부
+            if (koreanRate < 0.9) {
+              this.logger.info({
+                message:
+                  "Server rejected as Korean - insufficient Korean in description",
+                domain,
+                koreanRate,
+              });
+              await this.updateKoreanServerStatus(domain, false, koreanRate);
+              return false;
+            }
+          }
+        }
+
+        // 한국어 사용률 저장
+        this.koreanUsageRate = koreanRate;
+
+        // nodeInfo와 instanceInfo를 이용해서 서버 정보 업데이트
+        const serverInfo = this.extractServerInfo(instanceInfo, nodeInfo);
+
+        // DB에 전체 정보 업데이트
+        await this.updateServerInDb({
+          domain,
+          isActive: true,
+          isKoreanServer: true,
+          koreanUsageRate: this.koreanUsageRate,
+          ...serverInfo,
+          hasNodeInfo: !!nodeInfo,
+          isPersonalInstance: false,
+          instanceType: "community",
+          discovery_status: "completed",
+        });
+
+        this.logger.debug({
+          message: "Korean server information saved to DB",
+          domain,
+          serverInfo,
+          koreanUsageRate: this.koreanUsageRate,
+        });
+
         await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
         return true;
       }
@@ -1992,36 +2144,79 @@ export class KoreanActivityPubDiscovery {
   }
 
   extractServerInfo(instanceInfo, nodeInfo = null) {
-    if (!instanceInfo && !nodeInfo)
-      return {
-        softwareName: "unknown",
-        softwareVersion: "",
-        totalUsers: 0,
-        description: "",
-        nodeName: "",
-        nodeDescription: "",
-        registrationOpen: null,
-        registrationApprovalRequired: null,
-      };
+    // 기본값 설정
+    const defaults = {
+      softwareName: "unknown",
+      softwareVersion: "",
+      totalUsers: 0,
+      description: "",
+      nodeName: "",
+      nodeDescription: "",
+      registrationOpen: null,
+      registrationApprovalRequired: null,
+    };
+
+    if (!instanceInfo && !nodeInfo) return defaults;
+
+    const getDescription = () => {
+      // 우선순위: nodeInfo description > instance short_description > instance description
+      return (
+        nodeInfo?.metadata?.nodeDescription ||
+        instanceInfo?.short_description ||
+        instanceInfo?.description ||
+        defaults.description
+      );
+    };
 
     return {
+      // 소프트웨어 정보: NodeInfo 우선, 없으면 Instance API
       softwareName:
-        instanceInfo?.software?.name || nodeInfo?.software?.name || "unknown",
+        nodeInfo?.software?.name?.toLowerCase() ||
+        instanceInfo?.software?.name?.toLowerCase() ||
+        defaults.softwareName,
       softwareVersion:
-        instanceInfo?.software?.version || nodeInfo?.software?.version || "",
+        nodeInfo?.software?.version ||
+        instanceInfo?.software?.version ||
+        defaults.softwareVersion,
+
+      // 사용자 수: Instance API 우선, 없으면 NodeInfo
       totalUsers:
-        instanceInfo?.stats?.user_count || nodeInfo?.usage?.users?.total || 0,
-      description:
-        instanceInfo?.description || nodeInfo?.metadata?.description || "",
-      nodeName: nodeInfo?.metadata?.nodeName || instanceInfo?.title || "",
-      nodeDescription:
-        nodeInfo?.metadata?.nodeDescription || instanceInfo?.description || "",
+        instanceInfo?.stats?.user_count ||
+        nodeInfo?.usage?.users?.total ||
+        defaults.totalUsers,
+
+      // 설명: 우선순위에 따라 설정
+      description: getDescription(),
+
+      // 노드 이름: 우선순위 - nodeInfo nodeName > instanceInfo title > nodeInfo name > defaults
+      nodeName:
+        nodeInfo?.metadata?.nodeName ||
+        instanceInfo?.title || // Instance API의 title 사용
+        nodeInfo?.metadata?.name ||
+        defaults.nodeName,
+
+      // 노드 설명: 우선순위에 따라 설정
+      nodeDescription: getDescription(),
+
+      // 가입 설정: 모든 소스 확인
       registrationOpen:
         instanceInfo?.registrations?.enabled ??
         nodeInfo?.openRegistrations ??
-        null,
+        defaults.registrationOpen,
       registrationApprovalRequired:
-        instanceInfo?.registrations?.approval_required ?? null,
+        instanceInfo?.registrations?.approval_required ??
+        defaults.registrationApprovalRequired,
     };
+  }
+
+  // 디버그를 위한 새로운 메서드 추가
+  async debugServerStatus(domain) {
+    const server = await this.getServerFromDb(domain);
+    this.logger.debug({
+      message: "Current server status in DB",
+      domain,
+      server,
+    });
+    return server;
   }
 }

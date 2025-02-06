@@ -11,6 +11,7 @@ import suspiciousDomainsData from "../suspicious-domains.json" assert { type: "j
 import fs from "fs";
 import path from "path";
 import session from "express-session";
+import punycode from "punycode";
 
 dotenv.config(); // Ensure .env is loaded at the top
 
@@ -188,6 +189,168 @@ async function startServer() {
       });
     });
 
+    // HTML 테이블 생성 함수 추가
+    function createServerTableHtml(servers, isAdminView = false) {
+      const decodeDomain = (domain) => {
+        try {
+          return punycode.toUnicode(domain);
+        } catch (error) {
+          return domain;
+        }
+      };
+
+      const createTableRow = (server) => {
+        const decodedDomain = decodeDomain(server.domain);
+        const domainCell = `<td><a href="https://${server.domain}" target="_blank" rel="noopener noreferrer">${decodedDomain}</a></td>`;
+
+        if (isAdminView) {
+          return `
+            <tr>
+              <td>${server.node_name || "Unknown"}</td>
+              ${domainCell}
+              <td>${server.node_description || server.description || ""}</td>
+              <td>${server.instance_type || "unknown"}</td>
+              <td>${server.is_active ? "Active" : "Inactive"}</td>
+              <td>${server.total_users || "N/A"}</td>
+              <td>${
+                server.korean_usage_rate
+                  ? (server.korean_usage_rate * 100).toFixed(1) + "%"
+                  : "N/A"
+              }</td>
+              <td>${server.software_name || "N/A"} ${
+            server.software_version || ""
+          }</td>
+              <td>${new Date(server.last_checked).toLocaleString()}</td>
+            </tr>
+          `;
+        } else {
+          return `
+            <tr>
+              <td>${server.node_name || "Unknown"}</td>
+              ${domainCell}
+              <td>${server.node_description || server.description || ""}</td>
+              <td>${server.software_name || "N/A"} ${
+            server.software_version || ""
+          }</td>
+            </tr>
+          `;
+        }
+      };
+
+      return servers
+        .sort((a, b) => (b.total_users || 0) - (a.total_users || 0))
+        .map(createTableRow)
+        .join("");
+    }
+
+    // 기존 /yunabuju/servers 엔드포인트 수정
+    app.get("/yunabuju/servers", async (req, res) => {
+      try {
+        const servers = await discovery.getKnownServers(false, true);
+
+        const html = `
+          <html>
+            <head>
+              <title>Yunabuju Server List</title>
+              <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                table { width: 100%; border-collapse: collapse; }
+                th, td { padding: 8px; text-align: left; border: 1px solid #ddd; }
+                th { background-color: #f4f4f4; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+                a { color: #007bff; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+              </style>
+            </head>
+            <body>
+              <h1>Korean ActivityPub Server List</h1>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Server Name</th>
+                    <th>Domain</th>
+                    <th>Description</th>
+                    <th>Software</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${createServerTableHtml(servers)}
+                </tbody>
+              </table>
+            </body>
+          </html>
+        `;
+
+        res.send(html);
+      } catch (error) {
+        logger.error("Error fetching servers:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+
+    // 기존 /yunabuju/servers/all 엔드포인트 수정
+    app.get("/yunabuju/servers/all", authMiddleware, async (req, res) => {
+      try {
+        const includePersonal = req.session.showPersonal || false;
+        const servers = await discovery.getKnownServers(true, !includePersonal);
+
+        const html = `
+          <html>
+            <head>
+              <title>Yunabuju Server List</title>
+              <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                table { width: 100%; border-collapse: collapse; }
+                th, td { padding: 8px; text-align: left; border: 1px solid #ddd; }
+                th { background-color: #f4f4f4; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+                .filters { margin-bottom: 20px; }
+                .filters label { margin-right: 15px; }
+                a { color: #007bff; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+              </style>
+            </head>
+            <body>
+              <h1>Yunabuju Server List (Admin View)</h1>
+              <div class="filters">
+                <form id="filterForm" method="POST" action="/yunabuju/servers/all/filters">
+                  <label>
+                    <input type="checkbox" name="includePersonal" ${
+                      includePersonal ? "checked" : ""
+                    } onchange="this.form.submit()">
+                    Include Personal Instances
+                  </label>
+                </form>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Server Name</th>
+                    <th>Domain</th>
+                    <th>Description</th>
+                    <th>Type</th>
+                    <th>Status</th>
+                    <th>Users</th>
+                    <th>Korean Usage</th>
+                    <th>Software</th>
+                    <th>Last Checked</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${createServerTableHtml(servers, true)}
+                </tbody>
+              </table>
+            </body>
+          </html>
+        `;
+
+        res.send(html);
+      } catch (error) {
+        logger.error("Error fetching all servers:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+
     // API 라우트 수정 - 기본 서버 목록 (가입 가능한 커뮤니티 서버만)
     app.get("/yunabuju/servers", async (req, res) => {
       try {
@@ -326,32 +489,7 @@ async function startServer() {
                   </tr>
                 </thead>
                 <tbody>
-                  ${servers
-                    .sort((a, b) => (b.total_users || 0) - (a.total_users || 0))
-                    .map(
-                      (server) => `
-                    <tr>
-                      <td>${server.node_name || "Unknown"}</td>
-                      <td>${server.domain}</td>
-                      <td>${
-                        server.node_description || server.description || ""
-                      }</td>
-                      <td>${server.instance_type || "unknown"}</td>
-                      <td>${server.is_active ? "Active" : "Inactive"}</td>
-                      <td>${server.total_users || "N/A"}</td>
-                      <td>${
-                        server.korean_usage_rate
-                          ? (server.korean_usage_rate * 100).toFixed(1) + "%"
-                          : "N/A"
-                      }</td>
-                      <td>${server.software_name || "N/A"} ${
-                        server.software_version || ""
-                      }</td>
-                      <td>${new Date(server.last_checked).toLocaleString()}</td>
-                    </tr>
-                  `
-                    )
-                    .join("")}
+                  ${createServerTableHtml(servers, true)}
                 </tbody>
               </table>
               <script>
