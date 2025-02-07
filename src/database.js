@@ -27,6 +27,7 @@ const createTableSQL = `
     next_korean_check TIMESTAMP,
     is_personal_instance BOOLEAN DEFAULT NULL,
     instance_type VARCHAR(20) DEFAULT 'unknown',
+    matched_description TEXT,  -- 개인 서버 판단 근거 저장
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     discovery_batch_id VARCHAR(50),
