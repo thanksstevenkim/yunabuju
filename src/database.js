@@ -40,7 +40,8 @@ const createTableSQL = `
     last_response_size BIGINT,
     last_content_type VARCHAR(100),
     node_name VARCHAR(255),
-    node_description TEXT
+    node_description TEXT,
+    registration_type VARCHAR(20) DEFAULT 'open' -- 'open', 'approval_required', 'closed'
   );
 `;
 
@@ -137,6 +138,13 @@ async function setupDatabase() {
         BEGIN
           ALTER TABLE yunabuju_servers
             ADD COLUMN node_description TEXT;
+        EXCEPTION
+          WHEN duplicate_column THEN NULL;
+        END;
+
+        BEGIN
+          ALTER TABLE yunabuju_servers
+            ADD COLUMN registration_type VARCHAR(20) DEFAULT 'open';
         EXCEPTION
           WHEN duplicate_column THEN NULL;
         END;

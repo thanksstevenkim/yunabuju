@@ -336,9 +336,39 @@ export class KoreanActivityPubDiscovery {
     let isPersonal = false;
     let instanceType = "unknown";
     let matchedDescription = null;
+    let registrationType = "open";
 
     try {
-      // 1. 각각의 설명을 더 세밀하게 체크
+      // 1. 개인 서버 키워드 확장
+      const personalKeywords = [
+        "개인적",
+        "개인",
+        "개인용",
+        "1인",
+        "비공개",
+        "지인",
+        "personal",
+        "private",
+        "single user",
+        "my own",
+        "friends only",
+      ];
+
+      // 2. 등록 상태 확인
+      const registrationClosed =
+        instanceInfo?.registrations?.enabled === false ||
+        nodeInfo?.openRegistrations === false;
+
+      const approvalRequired =
+        instanceInfo?.registrations?.approval_required === true;
+
+      if (registrationClosed) {
+        registrationType = "closed";
+      } else if (approvalRequired) {
+        registrationType = "approval_required";
+      }
+
+      // 3. 설명에서 키워드 체크
       const descriptions = [
         { text: instanceInfo?.short_description, source: "short_description" },
         { text: instanceInfo?.description, source: "description" },
@@ -346,34 +376,20 @@ export class KoreanActivityPubDiscovery {
           text: nodeInfo?.metadata?.nodeDescription,
           source: "nodeinfo_description",
         },
-        { text: instanceInfo?.extended_description, source: "extended" },
         { text: nodeInfo?.metadata?.nodeName, source: "nodeinfo_name" },
       ];
 
-      // 개인 서버 키워드 확장
-      const personalKeywords = [
-        "개인적",
-        "개인",
-        "개인용",
-        "1인",
-        "비공개",
-        "personal",
-        "private",
-        "single user",
-        "my own",
-      ];
-
-      // 각 설명을 개별적으로 확인
+      // 설명에서 개인 서버 키워드 체크
       for (const desc of descriptions) {
         if (!desc.text) continue;
-
         const descText = desc.text.toLowerCase();
+
         for (const keyword of personalKeywords) {
           if (descText.includes(keyword)) {
             isPersonal = true;
             matchedDescription = {
               source: desc.source,
-              keyword: keyword,
+              keyword,
               text: desc.text,
             };
             break;
@@ -382,7 +398,10 @@ export class KoreanActivityPubDiscovery {
         if (isPersonal) break;
       }
 
-      // NodeInfo의 singleUser 플래그 체크
+      // 4. 추가 조건들 체크
+      const userCount = instanceInfo?.stats?.user_count || 0;
+
+      // NodeInfo의 singleUser 체크
       if (!isPersonal && nodeInfo?.metadata?.singleUser === true) {
         isPersonal = true;
         matchedDescription = {
@@ -391,21 +410,17 @@ export class KoreanActivityPubDiscovery {
           text: "nodeinfo.metadata.singleUser === true",
         };
       }
-
-      // 등록 제한 및 사용자 수 체크 (보조 지표)
-      const userCount = instanceInfo?.stats?.user_count || 0;
-      const registrationClosed =
-        instanceInfo?.registrations?.enabled === false ||
-        nodeInfo?.openRegistrations === false;
-
-      if (!isPersonal && registrationClosed && userCount <= 5) {
+      // 폐쇄적이고 소수 사용자
+      else if (!isPersonal && registrationClosed && userCount <= 5) {
         isPersonal = true;
         matchedDescription = {
           source: "registration_and_users",
           keyword: "closed_registration",
           text: `closed registration with ${userCount} users`,
         };
-      } else if (!isPersonal && userCount <= 2) {
+      }
+      // 최소 사용자 수
+      else if (!isPersonal && userCount <= 2) {
         isPersonal = true;
         matchedDescription = {
           source: "user_count",
@@ -414,21 +429,16 @@ export class KoreanActivityPubDiscovery {
         };
       }
 
-      // 인스턴스 유형 결정
       instanceType = isPersonal ? "personal" : "community";
 
-      // 로깅
-      this.logger.debug({
-        message: "Instance type identification",
-        domain,
+      return {
         isPersonal,
         instanceType,
         matchedDescription,
+        registrationType,
         userCount,
         registrationClosed,
-      });
-
-      return { isPersonal, instanceType, matchedDescription };
+      };
     } catch (error) {
       this.logger.error({
         message: "Error identifying instance type",
@@ -1528,7 +1538,8 @@ export class KoreanActivityPubDiscovery {
 
   async getKnownServers(
     includeClosedRegistration = false,
-    excludePersonal = false
+    excludePersonal = false,
+    includeApprovalRequired = false
   ) {
     let query = `
       SELECT * FROM yunabuju_servers 
@@ -1536,7 +1547,11 @@ export class KoreanActivityPubDiscovery {
     `;
 
     if (!includeClosedRegistration) {
-      query += ` AND registration_open = true`;
+      query += ` AND registration_type = 'open'`;
+    }
+
+    if (!includeApprovalRequired) {
+      query += ` AND (registration_type != 'approval_required' OR registration_type IS NULL)`;
     }
 
     if (excludePersonal) {

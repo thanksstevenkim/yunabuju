@@ -246,7 +246,13 @@ async function startServer() {
     // 기존 /yunabuju/servers 엔드포인트 수정
     app.get("/yunabuju/servers", async (req, res) => {
       try {
-        const servers = await discovery.getKnownServers(false, true);
+        const includeApprovalRequired =
+          req.query.includeApprovalRequired === "true";
+        const servers = await discovery.getKnownServers(
+          false,
+          true,
+          includeApprovalRequired
+        );
 
         const html = `
           <html>
@@ -261,9 +267,27 @@ async function startServer() {
                 a { color: #007bff; text-decoration: none; }
                 a:hover { text-decoration: underline; }
               </style>
+              <script>
+                function updateFilters(checkbox) {
+                  const params = new URLSearchParams(window.location.search);
+                  params.set(checkbox.name, checkbox.checked);
+                  window.location.href = '?' + params.toString();
+                }
+              </script>
             </head>
             <body>
               <h1>Korean ActivityPub Server List</h1>
+              <div class="filters">
+                <label>
+                  <input 
+                    type="checkbox" 
+                    name="includeApprovalRequired"
+                    ${includeApprovalRequired ? "checked" : ""}
+                    onchange="updateFilters(this)"
+                  >
+                  Include Approval Required Servers
+                </label>
+              </div>
               <table>
                 <thead>
                   <tr>
@@ -292,11 +316,14 @@ async function startServer() {
     app.get("/yunabuju/servers/all", authMiddleware, async (req, res) => {
       try {
         const includePersonal = req.query.includePersonal === "true";
+        const includeApprovalRequired =
+          req.query.includeApprovalRequired === "true";
 
-        // 세션에 현재 상태 저장
-        req.session.showPersonal = includePersonal;
-
-        const servers = await discovery.getKnownServers(true, !includePersonal);
+        const servers = await discovery.getKnownServers(
+          true,
+          !includePersonal,
+          includeApprovalRequired
+        );
 
         const html = `
           <html>
@@ -314,8 +341,10 @@ async function startServer() {
                 a:hover { text-decoration: underline; }
               </style>
               <script>
-                function updateFilter(checkbox) {
-                  window.location.href = '/yunabuju/servers/all?includePersonal=' + checkbox.checked;
+                function updateFilters(checkbox) {
+                  const params = new URLSearchParams(window.location.search);
+                  params.set(checkbox.name, checkbox.checked);
+                  window.location.href = '?' + params.toString();
                 }
               </script>
             </head>
@@ -325,10 +354,20 @@ async function startServer() {
                 <label>
                   <input 
                     type="checkbox" 
+                    name="includePersonal" 
                     ${includePersonal ? "checked" : ""}
-                    onchange="updateFilter(this)"
+                    onchange="updateFilters(this)"
                   >
                   Include Personal Instances
+                </label>
+                <label>
+                  <input 
+                    type="checkbox" 
+                    name="includeApprovalRequired" 
+                    ${includeApprovalRequired ? "checked" : ""}
+                    onchange="updateFilters(this)"
+                  >
+                  Include Approval Required Servers
                 </label>
               </div>
               <table>
