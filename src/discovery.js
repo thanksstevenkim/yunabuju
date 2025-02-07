@@ -338,16 +338,30 @@ export class KoreanActivityPubDiscovery {
     let matchedDescription = null;
 
     try {
-      // 1. 각각의 설명을 개별적으로 확인
+      // 1. 각각의 설명을 더 세밀하게 체크
       const descriptions = [
-        { text: instanceInfo?.description, source: "description" },
         { text: instanceInfo?.short_description, source: "short_description" },
-        { text: instanceInfo?.branding_server_description, source: "branding" },
+        { text: instanceInfo?.description, source: "description" },
+        {
+          text: nodeInfo?.metadata?.nodeDescription,
+          source: "nodeinfo_description",
+        },
         { text: instanceInfo?.extended_description, source: "extended" },
+        { text: nodeInfo?.metadata?.nodeName, source: "nodeinfo_name" },
       ];
 
-      // 개인 서버 키워드
-      const personalKeywords = ["개인적", "개인", "개인용", "1인", "비공개"];
+      // 개인 서버 키워드 확장
+      const personalKeywords = [
+        "개인적",
+        "개인",
+        "개인용",
+        "1인",
+        "비공개",
+        "personal",
+        "private",
+        "single user",
+        "my own",
+      ];
 
       // 각 설명을 개별적으로 확인
       for (const desc of descriptions) {
@@ -368,7 +382,7 @@ export class KoreanActivityPubDiscovery {
         if (isPersonal) break;
       }
 
-      // NodeInfo 기반 체크
+      // NodeInfo의 singleUser 플래그 체크
       if (!isPersonal && nodeInfo?.metadata?.singleUser === true) {
         isPersonal = true;
         matchedDescription = {
@@ -378,45 +392,41 @@ export class KoreanActivityPubDiscovery {
         };
       }
 
-      // 사용자 수 기반 체크 (보조 지표로만 사용)
+      // 등록 제한 및 사용자 수 체크 (보조 지표)
       const userCount = instanceInfo?.stats?.user_count || 0;
-      if (!isPersonal && userCount <= 3) {
+      const registrationClosed =
+        instanceInfo?.registrations?.enabled === false ||
+        nodeInfo?.openRegistrations === false;
+
+      if (!isPersonal && registrationClosed && userCount <= 5) {
+        isPersonal = true;
+        matchedDescription = {
+          source: "registration_and_users",
+          keyword: "closed_registration",
+          text: `closed registration with ${userCount} users`,
+        };
+      } else if (!isPersonal && userCount <= 2) {
         isPersonal = true;
         matchedDescription = {
           source: "user_count",
-          keyword: "low_users",
-          text: `user count: ${userCount}`,
-        };
-      }
-
-      // 가입 정책 체크 (보조 지표)
-      if (
-        !isPersonal &&
-        instanceInfo?.registrations?.enabled === false &&
-        userCount <= 5
-      ) {
-        isPersonal = true;
-        matchedDescription = {
-          source: "registration",
-          keyword: "closed_registration",
-          text: "closed registration with low user count",
+          keyword: "minimal_users",
+          text: `only ${userCount} users`,
         };
       }
 
       // 인스턴스 유형 결정
       instanceType = isPersonal ? "personal" : "community";
-      if (userCount === 0 && !isPersonal) {
-        instanceType = "unknown";
-      }
 
       // 로깅
-      if (isPersonal) {
-        this.logger.debug({
-          message: "Personal instance detected",
-          domain,
-          matchedDescription,
-        });
-      }
+      this.logger.debug({
+        message: "Instance type identification",
+        domain,
+        isPersonal,
+        instanceType,
+        matchedDescription,
+        userCount,
+        registrationClosed,
+      });
 
       return { isPersonal, instanceType, matchedDescription };
     } catch (error) {
@@ -997,7 +1007,7 @@ export class KoreanActivityPubDiscovery {
         { path: "/api/instance", method: "GET" },
       ];
 
-      // 기본 엔드포인트로 시도
+      // Mastodon/Pleroma API 먼저 시도
       for (const endpoint of commonEndpoints) {
         try {
           const response = await this.fetchWithBackoff(
@@ -1006,13 +1016,28 @@ export class KoreanActivityPubDiscovery {
           );
           if (!response) continue;
           const data = await response.json();
-          if (data) return this.processInstanceData(data);
+          if (data && (data.title || data.uri || data.description)) {
+            this.logger.debug({
+              message: "Instance info found via API",
+              domain,
+              endpoint: endpoint.path,
+              title: data.title,
+              description: data.description,
+            });
+            return this.processInstanceData(data);
+          }
         } catch (error) {
           if (error.message.includes("422")) continue;
+          this.logger.debug({
+            message: "API endpoint failed",
+            domain,
+            endpoint: endpoint.path,
+            error: error.message,
+          });
         }
       }
 
-      // Misskey 엔드포인트 시도
+      // Misskey API 시도
       try {
         const response = await this.fetchWithBackoff(
           `https://${domain}/api/meta`,
@@ -1049,6 +1074,7 @@ export class KoreanActivityPubDiscovery {
       stats: {
         user_count: data.stats?.users || data.stats?.user_count || 0,
       },
+      title: data.title || "", // Instance title 추가
       description: data.description || "",
       rules: data.rules || [],
       registrations: {
@@ -1164,7 +1190,14 @@ export class KoreanActivityPubDiscovery {
       return typeof content === "string" && content.length > 0;
     });
 
-    if (validPosts.length === 0) return 0;
+    // 최소 5개의 포스트만 있으면 분석 진행 (기존 값보다 낮춤)
+    if (validPosts.length < 5) {
+      this.logger.debug({
+        message: "Insufficient posts for analysis",
+        postsFound: validPosts.length,
+      });
+      return 0;
+    }
 
     const koreanPosts = validPosts.filter((post) => {
       const content =
@@ -1176,7 +1209,16 @@ export class KoreanActivityPubDiscovery {
       return this.containsKorean(cleanContent);
     });
 
-    return koreanPosts.length / validPosts.length;
+    const rate = koreanPosts.length / validPosts.length;
+
+    this.logger.debug({
+      message: "Timeline analysis complete",
+      totalPosts: validPosts.length,
+      koreanPosts: koreanPosts.length,
+      rate: rate,
+    });
+
+    return rate;
   }
 
   extractNextLink(linkHeader) {
@@ -1660,38 +1702,11 @@ export class KoreanActivityPubDiscovery {
       }
 
       // 2. 기본 정보 수집 (병렬)
-      let instanceInfo = null;
-      let nodeInfo = null;
-      let timelineData = null;
-
-      try {
-        [nodeInfo, instanceInfo, timelineData] = await Promise.all([
-          // NodeInfo 체크
-          Promise.race([
-            this.fetchNodeInfo(domain),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("NodeInfo Timeout")), 2000)
-            ),
-          ]).catch(() => null),
-
-          // Instance Info 체크
-          Promise.race([
-            this.fetchInstanceInfo(domain),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("Instance Timeout")), 2000)
-            ),
-          ]).catch(() => null),
-
-          // 타임라인 데이터 체크
-          this.fetchTimelineData(domain).catch(() => null),
-        ]);
-      } catch (error) {
-        this.logger.debug({
-          message: "Error fetching server information",
-          domain,
-          error: error.message,
-        });
-      }
+      let [nodeInfo, instanceInfo, timelineData] = await Promise.all([
+        this.fetchNodeInfo(domain).catch(() => null),
+        this.fetchInstanceInfo(domain).catch(() => null),
+        this.fetchTimelineData(domain).catch(() => null),
+      ]);
 
       // 3. 응답 데이터가 전혀 없으면 빠르게 실패
       if (!nodeInfo && !instanceInfo && !timelineData) {
@@ -1703,54 +1718,56 @@ export class KoreanActivityPubDiscovery {
         return false;
       }
 
-      // NodeInfo나 instanceInfo 데이터로 한국어 지원 여부 체크
-      const isKorean = await this.checkKoreanSupport(domain, nodeInfo || {});
-      if (isKorean) {
-        this.koreanUsageRate = 0.9; // 한글 설명이나 메타데이터가 있으면 높은 점수
+      // 4. 타임라인 분석
+      let koreanRate = 0;
+      if (timelineData) {
+        koreanRate = this.analyzeTimelineContent(timelineData);
+        this.logger.debug({
+          message: "Timeline analysis result",
+          domain,
+          koreanRate,
+        });
+      }
 
+      // 5. 메타데이터에서 한국어 지원 여부 체크
+      const hasKoreanSupport = await this.checkKoreanSupport(
+        domain,
+        nodeInfo || {}
+      );
+
+      // 6. 한국어 서버 판정 조건 수정
+      const isKorean =
+        (hasKoreanSupport && koreanRate >= 0.15) || // 메타데이터에 한국어가 있고 타임라인 한국어 사용률 15% 이상
+        koreanRate >= 0.3; // 또는 타임라인 한국어 사용률이 30% 이상
+
+      if (isKorean) {
         // nodeInfo와 instanceInfo를 이용해서 서버 정보 업데이트
         const serverInfo = this.extractServerInfo(instanceInfo, nodeInfo);
+        const { isPersonal, instanceType } = await this.identifyInstanceType(
+          domain,
+          instanceInfo,
+          nodeInfo
+        );
 
         // DB에 전체 정보 업데이트
         await this.updateServerInDb({
           domain,
           isActive: true,
           isKoreanServer: true,
-          koreanUsageRate: this.koreanUsageRate,
+          koreanUsageRate: koreanRate,
           ...serverInfo,
           hasNodeInfo: !!nodeInfo,
-          isPersonalInstance: false,
-          instanceType: "community",
+          isPersonalInstance: isPersonal,
+          instanceType, // 하드코딩된 "community" 대신 실제 판별된 타입 사용
           discovery_status: "completed",
         });
 
-        this.logger.debug({
-          message: "Korean server information saved to DB",
-          domain,
-          serverInfo,
-          koreanUsageRate: this.koreanUsageRate,
-        });
-
-        await this.updateKoreanServerStatus(domain, true, this.koreanUsageRate);
+        await this.updateKoreanServerStatus(domain, true, koreanRate);
         return true;
       }
 
-      // 타임라인 분석
-      if (timelineData) {
-        const koreanRate = this.analyzeTimelineContent(timelineData);
-        if (koreanRate > 0.3) {
-          this.koreanUsageRate = koreanRate;
-          await this.updateKoreanServerStatus(
-            domain,
-            true,
-            this.koreanUsageRate
-          );
-          return true;
-        }
-      }
-
       // 한국어 서버가 아닌 것으로 판단
-      await this.updateKoreanServerStatus(domain, false, 0);
+      await this.updateKoreanServerStatus(domain, false, koreanRate);
       return false;
     } catch (error) {
       const processingTime = performance.now() - startTime;
@@ -2027,7 +2044,7 @@ export class KoreanActivityPubDiscovery {
   }
 
   extractServerInfo(instanceInfo, nodeInfo = null) {
-    if (!instanceInfo && !nodeInfo)
+    if (!instanceInfo && !nodeInfo) {
       return {
         softwareName: "unknown",
         softwareVersion: "",
@@ -2038,19 +2055,79 @@ export class KoreanActivityPubDiscovery {
         registrationOpen: null,
         registrationApprovalRequired: null,
       };
+    }
+
+    // Get server name using priority order (Instance API 우선)
+    const nodeName =
+      instanceInfo?.title || // 1. Instance API title (높은 우선순위)
+      nodeInfo?.metadata?.nodeName || // 2. NodeInfo name
+      nodeInfo?.metadata?.name || // 3. Alternative NodeInfo name
+      instanceInfo?.name || // 4. Instance API name
+      "Unknown";
+
+    // 로그 추가
+    this.logger.debug({
+      message: "Server name resolution",
+      domain: instanceInfo?.domain || nodeInfo?.domain,
+      sources: {
+        instanceTitle: instanceInfo?.title,
+        nodeInfoName: nodeInfo?.metadata?.nodeName,
+        nodeInfoAltName: nodeInfo?.metadata?.name,
+        instanceName: instanceInfo?.name,
+      },
+      finalName: nodeName,
+    });
+
+    // Get description using priority order
+    const description =
+      nodeInfo?.metadata?.nodeDescription || // 1. Primary NodeInfo description
+      nodeInfo?.metadata?.description || // 2. Alternative NodeInfo description
+      instanceInfo?.description || // 3. Instance API description
+      instanceInfo?.short_description || // 4. Instance API short description
+      "";
+
+    // Get extended description using priority order
+    const nodeDescription =
+      nodeInfo?.metadata?.nodeDescription || // 1. Primary NodeInfo description
+      instanceInfo?.extended_description || // 2. Instance API extended description
+      instanceInfo?.description || // 3. Instance API main description
+      instanceInfo?.short_description || // 4. Instance API short description
+      description; // 5. Fall back to main description
+
+    this.logger.debug({
+      message: "Merging server info",
+      domain: instanceInfo?.domain || nodeInfo?.domain,
+      nodeInfo: {
+        nodeName: nodeInfo?.metadata?.nodeName,
+        nodeDescription: nodeInfo?.metadata?.nodeDescription,
+      },
+      instanceInfo: {
+        title: instanceInfo?.title,
+        description: instanceInfo?.description,
+        shortDescription: instanceInfo?.short_description,
+      },
+      final: {
+        nodeName,
+        description,
+        nodeDescription,
+      },
+    });
 
     return {
       softwareName:
-        instanceInfo?.software?.name || nodeInfo?.software?.name || "unknown",
+        instanceInfo?.software?.name ||
+        nodeInfo?.software?.name?.toLowerCase() ||
+        "unknown",
       softwareVersion:
         instanceInfo?.software?.version || nodeInfo?.software?.version || "",
       totalUsers:
-        instanceInfo?.stats?.user_count || nodeInfo?.usage?.users?.total || 0,
-      description:
-        instanceInfo?.description || nodeInfo?.metadata?.description || "",
-      nodeName: nodeInfo?.metadata?.nodeName || instanceInfo?.title || "",
-      nodeDescription:
-        nodeInfo?.metadata?.nodeDescription || instanceInfo?.description || "",
+        instanceInfo?.stats?.user_count ||
+        instanceInfo?.stats?.users?.total ||
+        nodeInfo?.usage?.users?.total ||
+        0,
+      description,
+      nodeName,
+      nodeDescription,
       registrationOpen:
         instanceInfo?.registrations?.enabled ??
         nodeInfo?.openRegistrations ??

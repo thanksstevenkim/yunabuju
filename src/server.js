@@ -291,7 +291,11 @@ async function startServer() {
     // 기존 /yunabuju/servers/all 엔드포인트 수정
     app.get("/yunabuju/servers/all", authMiddleware, async (req, res) => {
       try {
-        const includePersonal = req.session.showPersonal || false;
+        const includePersonal = req.query.includePersonal === "true";
+
+        // 세션에 현재 상태 저장
+        req.session.showPersonal = includePersonal;
+
         const servers = await discovery.getKnownServers(true, !includePersonal);
 
         const html = `
@@ -309,18 +313,23 @@ async function startServer() {
                 a { color: #007bff; text-decoration: none; }
                 a:hover { text-decoration: underline; }
               </style>
+              <script>
+                function updateFilter(checkbox) {
+                  window.location.href = '/yunabuju/servers/all?includePersonal=' + checkbox.checked;
+                }
+              </script>
             </head>
             <body>
               <h1>Yunabuju Server List (Admin View)</h1>
               <div class="filters">
-                <form id="filterForm" method="POST" action="/yunabuju/servers/all/filters">
-                  <label>
-                    <input type="checkbox" name="includePersonal" ${
-                      includePersonal ? "checked" : ""
-                    } onchange="this.form.submit()">
-                    Include Personal Instances
-                  </label>
-                </form>
+                <label>
+                  <input 
+                    type="checkbox" 
+                    ${includePersonal ? "checked" : ""}
+                    onchange="updateFilter(this)"
+                  >
+                  Include Personal Instances
+                </label>
               </div>
               <table>
                 <thead>
@@ -445,7 +454,7 @@ async function startServer() {
     // Protected admin data endpoint - 수정된 버전
     app.get("/yunabuju/servers/all", authMiddleware, async (req, res) => {
       try {
-        const includePersonal = req.session.showPersonal || false;
+        const includePersonal = req.session.showPersonal === true; // 명시적 비교
         const servers = await discovery.getKnownServers(true, !includePersonal);
 
         const html = `
@@ -465,11 +474,14 @@ async function startServer() {
             <body>
               <h1>Yunabuju Server List (Admin View)</h1>
               <div class="filters">
-                <form id="filterForm" method="POST" action="/yunabuju/servers/all/filters">
+                <form method="POST" action="/yunabuju/servers/all/filters">
                   <label>
-                    <input type="checkbox" name="includePersonal" ${
-                      includePersonal ? "checked" : ""
-                    } onchange="this.form.submit()">
+                    <input 
+                      type="checkbox" 
+                      name="includePersonal"
+                      ${includePersonal ? "checked" : ""}
+                      onchange="this.form.submit()"
+                    >
                     Include Personal Instances
                   </label>
                 </form>
@@ -492,13 +504,6 @@ async function startServer() {
                   ${createServerTableHtml(servers, true)}
                 </tbody>
               </table>
-              <script>
-                document.getElementById('includePersonal').onchange = function() {
-                  const currentUrl = new URL(window.location.href);
-                  currentUrl.searchParams.set('includePersonal', this.checked);
-                  window.location.href = currentUrl.toString();
-                };
-              </script>
             </body>
           </html>
         `;
@@ -512,8 +517,11 @@ async function startServer() {
 
     // 필터 설정 처리 - 수정된 버전
     app.post("/yunabuju/servers/all/filters", authMiddleware, (req, res) => {
-      req.session.showPersonal = req.body.showPersonal === "on";
-      res.redirect("/yunabuju/servers/all");
+      const includePersonal = req.body.includePersonal === "on";
+      req.session.showPersonal = includePersonal; // 세션에 상태 저장
+      req.session.save(() => {
+        res.redirect("/yunabuju/servers/all");
+      });
     });
 
     // 수동으로 서버 검색을 시작하는 엔드포인트
