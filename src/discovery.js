@@ -335,11 +335,11 @@ export class KoreanActivityPubDiscovery {
   async identifyInstanceType(domain, instanceInfo, nodeInfo) {
     let isPersonal = false;
     let instanceType = "unknown";
-    let matchedDescription = null;
     let registrationType = "open";
+    let matchedDescription = null;
 
     try {
-      // 1. 개인 서버 키워드 확장
+      // 1. 개인 서버 키워드 정의 - 함수 내부로 이동
       const personalKeywords = [
         "개인적",
         "개인",
@@ -354,19 +354,41 @@ export class KoreanActivityPubDiscovery {
         "friends only",
       ];
 
-      // 2. 등록 상태 확인
+      // Software type check
+      const softwareType = (
+        instanceInfo?.software?.name ||
+        nodeInfo?.software?.name ||
+        ""
+      ).toLowerCase();
+
+      // Registration status check
       const registrationClosed =
         instanceInfo?.registrations?.enabled === false ||
         nodeInfo?.openRegistrations === false;
 
+      // Approval check based on software type
       const approvalRequired =
-        instanceInfo?.registrations?.approval_required === true;
+        softwareType === "misskey" || softwareType === "cherrypick"
+          ? !nodeInfo?.openRegistrations
+          : instanceInfo?.registrations?.approval_required === true;
 
       if (registrationClosed) {
         registrationType = "closed";
       } else if (approvalRequired) {
         registrationType = "approval_required";
       }
+
+      this.logger.debug({
+        message: "Registration status check",
+        domain,
+        registrationClosed,
+        approvalRequired,
+        registrationType,
+        instanceInfo: {
+          enabled: instanceInfo?.registrations?.enabled,
+          approval_required: instanceInfo?.registrations?.approval_required,
+        },
+      });
 
       // 3. 설명에서 키워드 체크
       const descriptions = [
@@ -438,6 +460,7 @@ export class KoreanActivityPubDiscovery {
         registrationType,
         userCount,
         registrationClosed,
+        approvalRequired,
       };
     } catch (error) {
       this.logger.error({
@@ -446,9 +469,10 @@ export class KoreanActivityPubDiscovery {
         error: error.message,
       });
       return {
-        isPersonal: null,
-        instanceType: "unknown",
+        isPersonal: false,
+        instanceType: "community", // 에러 시 기본값을 community로
         matchedDescription: null,
+        registrationType: "open",
       };
     }
   }
@@ -498,12 +522,9 @@ export class KoreanActivityPubDiscovery {
 
       const nodeInfo = await this.fetchNodeInfo(domain);
 
-      // 인스턴스 유형 먼저 확인
-      const { isPersonal, instanceType } = await this.identifyInstanceType(
-        domain,
-        instanceInfo,
-        nodeInfo
-      );
+      // 인스턴스 유형 먼저 확인 - registrationType도 포함
+      const { isPersonal, instanceType, registrationType } =
+        await this.identifyInstanceType(domain, instanceInfo, nodeInfo);
 
       // 개인 인스턴스로 확인되면 더 이상 진행하지 않음
       if (isPersonal) {
@@ -512,6 +533,7 @@ export class KoreanActivityPubDiscovery {
           isActive: true,
           isPersonalInstance: true,
           instanceType: "personal",
+          registrationType, // 추가
           ...this.extractServerInfo(instanceInfo),
           hasNodeInfo: !!nodeInfo,
           isKoreanServer: false, // 개인 인스턴스는 한국어 서버 체크 안함
@@ -542,6 +564,7 @@ export class KoreanActivityPubDiscovery {
         isKoreanServer: true,
         isPersonalInstance: false,
         instanceType: "community",
+        registrationType, // 추가
       });
 
       await this.updateKoreanServerStatus(domain, true, koreanUsageRate);
@@ -1075,6 +1098,17 @@ export class KoreanActivityPubDiscovery {
   }
 
   processInstanceData(data, type = "mastodon") {
+    const registrations = {
+      enabled:
+        type === "misskey"
+          ? !data.disableRegistration
+          : data.registrations?.enabled ?? !data.closed,
+      approval_required:
+        type === "mastodon" || type === "pleroma"
+          ? data.registrations?.approval_required ?? false
+          : false, // Misskey, Cherrypick 등은 nodeinfo에서만 확인 가능
+    };
+
     return {
       software: {
         name: type,
@@ -1084,22 +1118,26 @@ export class KoreanActivityPubDiscovery {
       stats: {
         user_count: data.stats?.users || data.stats?.user_count || 0,
       },
-      title: data.title || "", // Instance title 추가
+      title: data.title || "",
       description: data.description || "",
       rules: data.rules || [],
-      registrations: {
-        enabled:
-          type === "misskey"
-            ? !data.disableRegistration
-            : data.registrations?.enabled ?? !data.closed,
-      },
+      registrations,
     };
   }
 
   processNodeInfo(nodeInfo) {
+    // Software 이름 확인
+    const softwareName = (nodeInfo.software?.name || "unknown").toLowerCase();
+
+    // Misskey나 Cherrypick의 경우 NodeInfo의 openRegistrations로 판단
+    const approval_required =
+      softwareName === "misskey" || softwareName === "cherrypick"
+        ? !nodeInfo.openRegistrations // 등록이 닫혀있으면 approval이 필요한 것으로 간주
+        : null; // 다른 소프트웨어는 Instance API에서 확인
+
     return {
       software: {
-        name: nodeInfo.software?.name?.toLowerCase() || "unknown",
+        name: softwareName,
         version: nodeInfo.software?.version,
       },
       languages: nodeInfo.metadata?.languages || [],
@@ -1113,6 +1151,7 @@ export class KoreanActivityPubDiscovery {
       rules: [],
       registrations: {
         enabled: nodeInfo.openRegistrations !== false,
+        approval_required: approval_required,
       },
     };
   }
@@ -1486,8 +1525,9 @@ export class KoreanActivityPubDiscovery {
         (domain, is_active, korean_usage_rate, software_name, software_version,
         registration_open, registration_approval_required, total_users,
         description, has_nodeinfo, is_korean_server, is_personal_instance,
-        instance_type, last_checked, discovery_status, node_name, node_description)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, $14, $15, $16)
+        instance_type, last_checked, discovery_status, node_name, node_description,
+        registration_type)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, $14, $15, $16, $17)
       ON CONFLICT (domain) 
       DO UPDATE SET 
         is_active = $2,
@@ -1504,6 +1544,7 @@ export class KoreanActivityPubDiscovery {
         instance_type = $13,
         node_name = $15,
         node_description = $16,
+        registration_type = $17,
         last_checked = CURRENT_TIMESTAMP,
         discovery_status = COALESCE($14, yunabuju_servers.discovery_status),
         updated_at = CURRENT_TIMESTAMP
@@ -1524,8 +1565,9 @@ export class KoreanActivityPubDiscovery {
       server.isPersonalInstance,
       server.instanceType,
       server.discovery_status,
-      server.nodeName, // 추가
-      server.nodeDescription, // 추가
+      server.nodeName,
+      server.nodeDescription,
+      server.registrationType || "open", // 추가된 필드
     ]);
 
     this.logger.debug({
@@ -1547,11 +1589,11 @@ export class KoreanActivityPubDiscovery {
     `;
 
     if (!includeClosedRegistration) {
-      query += ` AND registration_type = 'open'`;
-    }
-
-    if (!includeApprovalRequired) {
-      query += ` AND (registration_type != 'approval_required' OR registration_type IS NULL)`;
+      query += ` AND (registration_type = 'open'`;
+      if (includeApprovalRequired) {
+        query += ` OR registration_type = 'approval_required'`;
+      }
+      query += `)`;
     }
 
     if (excludePersonal) {
@@ -2150,16 +2192,5 @@ export class KoreanActivityPubDiscovery {
       registrationApprovalRequired:
         instanceInfo?.registrations?.approval_required ?? null,
     };
-  }
-
-  // 디버그를 위한 새로운 메서드 추가
-  async debugServerStatus(domain) {
-    const server = await this.getServerFromDb(domain);
-    this.logger.debug({
-      message: "Current server status in DB",
-      domain,
-      server,
-    });
-    return server;
-  }
+  } // 디버그를 위한 새로운 메서드 추가  async debugServerStatus(domain) {    const server = await this.getServerFromDb(domain);    this.logger.debug({      message: "Current server status in DB",      domain,      server,    });    return server;  }
 }
