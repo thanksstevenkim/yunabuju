@@ -195,6 +195,26 @@ async function resetDatabase() {
   }
 }
 
+function checkRegistrationStatus(instanceInfo) {
+  const registrationClosed = !instanceInfo?.enabled;
+  const approvalRequired = instanceInfo?.approval_required === true;
+
+  let registrationType = "unknown";
+  if (registrationClosed) {
+    registrationType = "closed";
+  } else if (approvalRequired) {
+    registrationType = "approval";
+  } else {
+    registrationType = "open";
+  }
+
+  return {
+    registrationClosed,
+    approvalRequired,
+    registrationType,
+  };
+}
+
 const currentFile = fileURLToPath(import.meta.url);
 
 if (process.argv[1] === currentFile) {
@@ -225,4 +245,4 @@ if (process.argv[1] === currentFile) {
   }
 }
 
-export { setupDatabase, resetDatabase };
+export { setupDatabase, resetDatabase, checkRegistrationStatus };
